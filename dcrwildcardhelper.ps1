@@ -2,7 +2,7 @@
 Set-StrictMode -Version Latest
 
 # In testing mode speed things up by not calling run-command first time
-$IsTestingMode = $true
+$IsTestingMode = $false
 
 # Define the Linux paths
 #$linuxPaths = @(
@@ -97,28 +97,216 @@ function Get-VMListsFromCSV {
     }
 }
 
+function Get-SplunkPathSeparator {
+    param (
+        [bool]$IsLinuxVm
+    )
+
+    if ($IsLinuxVm) {
+        return '/'
+    }
+
+    return '\'
+}
+
+function Get-SplunkPathSegments {
+    param (
+        [string]$Path,
+        [bool]$IsLinuxVm
+    )
+
+    $separator = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
+    return @($Path -split [regex]::Escape($separator))
+}
+
+function Test-SplunkSegmentHasWildcard {
+    param (
+        [string]$Segment
+    )
+
+    return $Segment -eq '...' -or $Segment.IndexOf('*') -ge 0 -or $Segment.IndexOf('?') -ge 0
+}
+
+function Test-SplunkPatternHasWildcard {
+    param (
+        [string]$Pattern,
+        [bool]$IsLinuxVm
+    )
+
+    foreach ($segment in (Get-SplunkPathSegments -Path $Pattern -IsLinuxVm $IsLinuxVm)) {
+        if (Test-SplunkSegmentHasWildcard -Segment $segment) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Convert-SplunkSegmentToRegex {
+    param (
+        [string]$Segment,
+        [bool]$RegexMetaActive,
+        [bool]$IsLinuxVm
+    )
+
+    $segmentWildcard = if ($IsLinuxVm) { '[^/]*' } else { '[^\\]*' }
+    $singleCharWildcard = if ($IsLinuxVm) { '[^/]' } else { '[^\\]' }
+    $regexBuilder = New-Object System.Text.StringBuilder
+    $index = 0
+
+    while ($index -lt $Segment.Length) {
+        $char = $Segment[$index]
+
+        if ($char -eq '[' -and $RegexMetaActive) {
+            $classEnd = $Segment.IndexOf(']', $index + 1)
+            if ($classEnd -gt $index) {
+                [void]$regexBuilder.Append($Segment.Substring($index, $classEnd - $index + 1))
+                $index = $classEnd + 1
+                continue
+            }
+        }
+
+        switch ($char) {
+            '*' {
+                [void]$regexBuilder.Append($segmentWildcard)
+            }
+            '?' {
+                [void]$regexBuilder.Append($singleCharWildcard)
+            }
+            '.' {
+                [void]$regexBuilder.Append('\.')
+            }
+            '(' {
+                [void]$regexBuilder.Append($(if ($RegexMetaActive) { '(' } else { '\(' }))
+            }
+            ')' {
+                [void]$regexBuilder.Append($(if ($RegexMetaActive) { ')' } else { '\)' }))
+            }
+            '|' {
+                [void]$regexBuilder.Append($(if ($RegexMetaActive) { '|' } else { '\|' }))
+            }
+            '[' {
+                [void]$regexBuilder.Append('\[')
+            }
+            ']' {
+                [void]$regexBuilder.Append('\]')
+            }
+            '^' {
+                [void]$regexBuilder.Append($(if ($RegexMetaActive) { '^' } else { '\^' }))
+            }
+            '$' {
+                [void]$regexBuilder.Append($(if ($RegexMetaActive) { '$' } else { '\$' }))
+            }
+            '+' {
+                [void]$regexBuilder.Append($(if ($RegexMetaActive) { '+' } else { '\+' }))
+            }
+            '{' {
+                [void]$regexBuilder.Append($(if ($RegexMetaActive) { '{' } else { '\{' }))
+            }
+            '}' {
+                [void]$regexBuilder.Append($(if ($RegexMetaActive) { '}' } else { '\}' }))
+            }
+            '\' {
+                [void]$regexBuilder.Append('\\')
+            }
+            default {
+                [void]$regexBuilder.Append([regex]::Escape([string]$char))
+            }
+        }
+
+        $index++
+    }
+
+    return $regexBuilder.ToString()
+}
+
 function Convert-SplunkWildcardToRegex {
     param (
         [Parameter(Mandatory = $true)]
         [string]$Pattern,
-        [Parameter(Mandatory = $true)]
-        [bool]$IsLinuxVm = $true
+        [bool]$IsLinuxVm
     )
 
-    # Replace escaped Splunk wildcards with regex equivalents
-    $regexPattern = $Pattern -replace '\.\.\.', '.*'      # '...' → '.*'
+    $separator = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
+    $separatorRegex = [regex]::Escape($separator)
+    $segmentOneOrMore = if ($IsLinuxVm) { '[^/]+' } else { '[^\\]+' }
+    $segments = Get-SplunkPathSegments -Path $Pattern -IsLinuxVm $IsLinuxVm
+    $regexBuilder = New-Object System.Text.StringBuilder
+    $wildcardSeen = $false
+    $hasLeadingSeparator = $IsLinuxVm -and $Pattern.StartsWith($separator)
+    $emittedSegment = $false
 
-    if ($IsLinuxVm -eq $true) {
-        $regexPattern = $regexPattern -replace '\*', '[^/]+'      # '*' → '[^/]+'
-    }
-    else {
-        # double backslashes for Windows
-        $regexPattern = $regexPattern -replace '\\', '\\'      # '\' → '\\'
-        $regexPattern = $regexPattern -replace '\*', '[^\\]+'      # '*' → '[^/]+'
+    [void]$regexBuilder.Append('^')
+    if ($hasLeadingSeparator) {
+        [void]$regexBuilder.Append($separatorRegex)
     }
 
-    # Return the final regex pattern
-    return $regexPattern
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrEmpty($segment)) {
+            continue
+        }
+
+        if ($segment -eq '...') {
+            if ($emittedSegment -or $hasLeadingSeparator) {
+                [void]$regexBuilder.Append("(?:$separatorRegex$segmentOneOrMore)+")
+            }
+            else {
+                [void]$regexBuilder.Append("(?:$segmentOneOrMore$separatorRegex)+")
+            }
+
+            $wildcardSeen = $true
+            $emittedSegment = $true
+            continue
+        }
+
+        if ($emittedSegment) {
+            [void]$regexBuilder.Append($separatorRegex)
+        }
+
+        $segmentHasWildcard = Test-SplunkSegmentHasWildcard -Segment $segment
+        $segmentRegex = Convert-SplunkSegmentToRegex -Segment $segment -RegexMetaActive ($wildcardSeen -or $segmentHasWildcard) -IsLinuxVm $IsLinuxVm
+        [void]$regexBuilder.Append($segmentRegex)
+
+        if ($segmentHasWildcard) {
+            $wildcardSeen = $true
+        }
+
+        $emittedSegment = $true
+    }
+
+    [void]$regexBuilder.Append('$')
+    return $regexBuilder.ToString()
+}
+
+function Test-SplunkPathMatch {
+    param (
+        [string]$Path,
+        [string]$Pattern,
+        [bool]$IsLinuxVm
+    )
+
+    $regexPattern = Convert-SplunkWildcardToRegex -Pattern $Pattern -IsLinuxVm $IsLinuxVm
+    return $Path -match $regexPattern
+}
+
+function Get-ParentFolderPath {
+    param (
+        [string]$Path,
+        [bool]$IsLinuxVm
+    )
+
+    $separator = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
+    $lastSeparatorIndex = $Path.LastIndexOf($separator)
+
+    if ($lastSeparatorIndex -lt 0) {
+        return $null
+    }
+
+    if ($lastSeparatorIndex -eq 0) {
+        return $separator
+    }
+
+    return $Path.Substring(0, $lastSeparatorIndex)
 }
 
 # Make a name from a wildcard path by stripping out any wildcard characters
@@ -139,7 +327,7 @@ function Get-DcrFolderPath {
     param (
         [string]$VmResourceId,
         [string]$Folder,
-        [bool]$IsLinuxVm = $true
+        [bool]$IsLinuxVm
     )
 
     $retDcrFolderPath = $null
@@ -400,32 +588,24 @@ function Get-AnchorFromWildcard {
         [bool]$IsLinuxVm
     )
 
-    # Build an "anchor": everything before the first segment that contains a wildcard (* ? [)
-    if ($IsLinuxVm -eq $true) {
-        # Convert Windows path to use '/' for easier processing
-        $segments = $SplunkWildcardPathname -split '/'
-    }
-    else {
-        # Ensure Windows path uses '\' (it should already)
-       $segments = $SplunkWildcardPathname -split '\\'
-    }
+    $segments = Get-SplunkPathSegments -Path $SplunkWildcardPathname -IsLinuxVm $IsLinuxVm
+    $separator = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
     
     $anchorSegments = @()
-    $sawWildcard = $false
     foreach ($seg in $segments) {
-        if ($seg -match '[\*\?\[\.]') { $sawWildcard = $true; break }
+        if (Test-SplunkSegmentHasWildcard -Segment $seg) { break }
         if ($seg -ne '') { $anchorSegments += $seg }
     }
 
     if ($IsLinuxVm) {
         # If the pattern starts with '/', keep it in the anchor for correct matching
-        $leadingSlash = $SplunkWildcardPathname.StartsWith('/')
+        $leadingSlash = $SplunkWildcardPathname.StartsWith($separator)
 
-        $anchor = ($anchorSegments -join '/')
-        if ($leadingSlash) { $anchor = "/$anchor" }
+        $anchor = ($anchorSegments -join $separator)
+        if ($leadingSlash) { $anchor = "$separator$anchor" }
     }
     else {
-        $anchor = ($anchorSegments -join '\')
+        $anchor = ($anchorSegments -join $separator)
     }
 
     return $anchor
@@ -443,8 +623,9 @@ function Get-FirstDcrFilePattern {
     )
 
     foreach ($item in $splunkWildcardPaths) {
-        # eg '/var/.../*.log' becomes '/var/.*/[^/]+.log'
-        $regexPattern = Convert-SplunkWildcardToRegex -Pattern $item -IsLinuxVm $IsLinuxVm
+        if (Test-SplunkPathMatch -Path $Folder -Pattern $item -IsLinuxVm $IsLinuxVm) {
+            return $Folder
+        }
 
         # eg '/*.log'
         if ($IsLinuxVm -eq $true) {
@@ -458,7 +639,7 @@ function Get-FirstDcrFilePattern {
         $dcrFilePattern = $Folder + $splunkPatternFileName
         
         # eg '/var/log/*.log' matches '/var/[^/]+/[^/]+.log'
-        if ($dcrFilePattern -match $regexPattern) {
+                if (Test-SplunkPathMatch -Path $dcrFilePattern -Pattern $item -IsLinuxVm $IsLinuxVm) {
             return $dcrFilePattern
         }
     }
@@ -882,32 +1063,29 @@ function main {
 
         Write-Host "Processing Azure Windows VM: $machine in Resource Group: $resourceGroup under Subscription: $subscriptionId" -ForegroundColor Green
 
-        $cmdTemplateLinux = 'find $anchor -wholename "$path" $pipeline'
-        $cmdTemplateWindows = 'Get-ChildItem -Path $anchor -Recurse -Force | Where-Object { $_.FullName -like "$path" } | Select-Object -ExpandProperty FullName'
-
-        if ($IsLinuxVm -eq $false) {
-            $cmdTemplate = $cmdTemplateWindows
-        }
-        else {
-            $cmdTemplate = $cmdTemplateLinux
-        }
-
         # make big command as run-command is expensive, so do once per server
         $cmds = ""
         foreach ($wildcardPath in $SplunkWildcardPaths) {
             $anchor = Get-AnchorFromWildcard -SplunkWildcardPathname $wildcardPath -IsLinuxVm $IsLinuxVm
-            # if path contains a wildcard then use dirname to return the folder name only
-            # else we already have the folder name eg /etc
-            if ($wildcardPath -match '[\*\?\[\.]') {
-                $pipeline = "| xargs -I {} dirname {} | sort -u"
+            $patternHasWildcard = Test-SplunkPatternHasWildcard -Pattern $wildcardPath -IsLinuxVm $IsLinuxVm
+
+            if ($patternHasWildcard) {
+                if ($IsLinuxVm) {
+                    $cmd = "find `"$anchor`" \( -type f -o -type d \) -printf '%y:%p`n'"
+                }
+                else {
+                    $cmd = "Get-ChildItem -Path '$anchor' -Recurse -Force | ForEach-Object { if (`$_.PSIsContainer) { 'd:' + `$_.FullName } else { 'f:' + `$_.FullName } }"
+                }
             }
             else {
-                $pipeline = "| sort -u"
+                if ($IsLinuxVm) {
+                    $cmd = "if [ -e `"$wildcardPath`" ]; then if [ -d `"$wildcardPath`" ]; then printf 'd:%s`n' `"$wildcardPath`"; else printf 'f:%s`n' `"$wildcardPath`"; fi; fi"
+                }
+                else {
+                    $cmd = "if (Test-Path -LiteralPath '$wildcardPath') { `$item = Get-Item -LiteralPath '$wildcardPath' -Force; if (`$item.PSIsContainer) { 'd:' + `$item.FullName } else { 'f:' + `$item.FullName } }"
+                }
             }
-            $cmd = $cmdTemplate `
-                -replace '\$anchor', $anchor `
-                -replace '\$path', $wildcardPath `
-                -replace '\$pipeline', $pipeline
+
             $cmds += $cmd + "; "
         }
 
@@ -917,11 +1095,11 @@ function main {
         try {
             if ($IsTestingMode) {
                 # Azure Linux test case
-                #$resultArr = ,@('/var/log')
+                #$resultArr = ,@('d:/var/log')
                 # Arc Linux Test Case
-                #$resultArr = ,@('/var/log/azure/run-command-handler')
+                #$resultArr = ,@('d:/var/log/azure/run-command-handler')
                 # Arc Windows Text case
-                $resultArr = ,@('C:\Logs')
+                $resultArr = ,@('d:C:\Logs')
                 $sleepTime = 10
                 $maxRetries = 3
             }
@@ -948,8 +1126,43 @@ function main {
             $resultArr = $result.Value[0].Message -split "`n"
         }
 
+        $matchedFolders = @()
+        foreach ($candidateLineRaw in ($resultArr | Select-Object -Unique)) {
+            $candidateLine = $candidateLineRaw.Trim()
+
+            if ([string]::IsNullOrWhiteSpace($candidateLine) -or $candidateLine.Length -lt 3 -or $candidateLine[1] -ne ':') {
+                continue
+            }
+
+            $candidateType = $candidateLine.Substring(0, 1).ToLowerInvariant()
+            $candidatePath = $candidateLine.Substring(2)
+
+            if ($IsLinuxVm -eq $false) {
+                if ($candidatePath -notmatch '^[a-zA-Z]:\\') { continue }
+            }
+            else {
+                if ($candidatePath -notlike '/*') { continue }
+            }
+
+            foreach ($wildcardPath in $SplunkWildcardPaths) {
+                if (-not (Test-SplunkPathMatch -Path $candidatePath -Pattern $wildcardPath -IsLinuxVm $IsLinuxVm)) {
+                    continue
+                }
+
+                if ($candidateType -eq 'd') {
+                    $matchedFolders += $candidatePath
+                }
+                elseif ($candidateType -eq 'f') {
+                    $parentFolder = Get-ParentFolderPath -Path $candidatePath -IsLinuxVm $IsLinuxVm
+                    if ($null -ne $parentFolder) {
+                        $matchedFolders += $parentFolder
+                    }
+                }
+            }
+        }
+
         # keep the unique entries in the array
-        $resultArrUnique = $resultArr | Select-Object -Unique
+        $resultArrUnique = $matchedFolders | Select-Object -Unique
 
         foreach ($folder in $resultArrUnique) {
 
@@ -1043,7 +1256,7 @@ function main {
 $connectedMachinesAndVmsHash = Get-VMListsFromCSV -CsvPath ./connectedMachinesAndVms.csv
 
 # entry point for Azure Linux VMs
-#main -SplunkWildcardPaths $linuxAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureLinuxVMs"] -IsArcConnectedMachine $false -IsLinuxVm $true
+main -SplunkWildcardPaths $linuxAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureLinuxVMs"] -IsArcConnectedMachine $false -IsLinuxVm $true
 
 # Entry point for Arc Linux VMs
 #main -SplunkWildcardPaths $linuxArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcLinuxVMs"]  -IsArcConnectedMachine $true -IsLinuxVm $true
@@ -1051,6 +1264,6 @@ $connectedMachinesAndVmsHash = Get-VMListsFromCSV -CsvPath ./connectedMachinesAn
 # Entry point for Arc Windows VMs
 #main -SplunkWildcardPaths $windowsArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcWindowsVMs"] -IsArcConnectedMachine $true -IsLinuxVm $false
 
-# Entry point for Arc Windows VMs
+# Entry point for Azure Windows VMs
 main -SplunkWildcardPaths $windowsAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureWindowsVMs"] -IsArcConnectedMachine $false -IsLinuxVm $false
 
