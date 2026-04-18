@@ -4,6 +4,9 @@ Set-StrictMode -Version Latest
 # In testing mode speed things up by not calling run-command first time
 $IsTestingMode = $false
 
+# When enabled, emit a debug summary of discovered folders per server and the patterns they matched
+$IsDebugLoggingEnabled = $true
+
 # Define the Linux paths
 #$linuxPaths = @(
 #    "/home/*/.bash_history",
@@ -16,7 +19,8 @@ $IsTestingMode = $false
 # for example Splunk '/var/.../*.log' becomes '/var/.*/[^/]+.log' in RegEx and '/var/myparentfolder/myfolder*/*.log in DCR (multiple potentially required) 
 # for example Splunk '/var/*/*.log' becomes '/var/[^/]+/[^/]+.log' in RegEx and '/var/myfolder*/*.log' in DCR (multiple potentially required)
 $linuxAzureSplunkWildcardPatterns = @(
-    "/var/log/waagent*.log"
+    "/var/log/waagent*.log",
+    "/tmp/log/.../*.log"
 )
 
 $linuxArcSplunkWildcardPatterns = @(
@@ -31,7 +35,7 @@ $windowsArcSplunkWildcardPatterns = @(
 $windowsAzureSplunkWildcardPatterns = $windowsArcSplunkWildcardPatterns;
 
 # location for the DCRs
-$dcrLocation = "uksouth"
+$dcrLocation = "westeurope"
 # storage account for scripts and script logs
 $scriptStorageAccount = "arcserversukssa"
 # container name for scripts and script logs
@@ -518,8 +522,13 @@ function New-DcrFromWildcard {
         $kind = "Windows"
     }
 
-    # Lookup Workspace Resource Id based on its Id
-    $workspaceResourceId = "/subscriptions/$dcrSubscriptionId/resourcegroups/$dcrResourceGroupName/providers/microsoft.operationalinsights/workspaces/$workspaceName"
+    # Resolve the actual workspace resource instead of assuming it shares the DCR resource group.
+    $workspaceResource = @(Get-AzResource -ResourceType "Microsoft.OperationalInsights/workspaces" -Name $workspaceName -ErrorAction Stop) | Select-Object -First 1
+    if ($null -eq $workspaceResource) {
+        throw "Workspace $workspaceName was not found in subscription $dcrSubscriptionId."
+    }
+
+    $workspaceResourceId = $workspaceResource.ResourceId
 
     # Create DCR payload
     $dcrPayload = @{
@@ -884,10 +893,16 @@ function RunCommand {
         [bool]$IsAsync = $false
     )
 
-    # Create a key combining all three boolean states
-    $caseKey = "$IsArcConnectedMachine-$IsLinuxVm-$IsAsync"
+    $retryMax = 10
+    $retryDelay = 60  # seconds
 
-    switch ($caseKey) {
+    for ($attempt = 1; $attempt -le $retryMax; $attempt++) {
+        try {
+            $result = $null
+            # Create a key combining all three boolean states
+            $caseKey = "$IsArcConnectedMachine-$IsLinuxVm-$IsAsync"
+
+            switch ($caseKey) {
         # Arc + Linux + Async
         "True-True-True" {
             $result = New-AzConnectedMachineRunCommand `
@@ -904,7 +919,8 @@ function RunCommand {
                 -ResourceGroupName $ResourceGroupName `
                 -MachineName $VMName `
                 -CommandId 'RunShellScript' `
-                -ScriptString $ScriptString
+                -ScriptString $ScriptString `
+                -ErrorAction Stop
         }
         # Arc + Windows + Async
         "True-False-True" {
@@ -922,7 +938,8 @@ function RunCommand {
                 -ResourceGroupName $ResourceGroupName `
                 -MachineName $VMName `
                 -CommandId 'RunPowerShellScript' `
-                -ScriptString $ScriptString
+                -ScriptString $ScriptString `
+                -ErrorAction Stop
         }
         # Azure VM + Linux + Async
         "False-True-True" {
@@ -939,7 +956,8 @@ function RunCommand {
                 -ResourceGroupName $ResourceGroupName `
                 -VMName $VMName `
                 -CommandId 'RunShellScript' `
-                -ScriptString $ScriptString
+                -ScriptString $ScriptString `
+                -ErrorAction Stop
         }
         # Azure VM + Windows + Async
         "False-False-True" {
@@ -956,11 +974,23 @@ function RunCommand {
                 -ResourceGroupName $ResourceGroupName `
                 -VMName $VMName `
                 -CommandId 'RunPowerShellScript' `
-                -ScriptString $ScriptString
+                -ScriptString $ScriptString `
+                -ErrorAction Stop
+        }
+            }
+
+            return $result
+        }
+        catch {
+            if ($_.Exception.Message -match '409|Conflict|in progress' -and $attempt -lt $retryMax) {
+                Write-Host "Run command conflict on $VMName (attempt $attempt/$retryMax). Retrying in ${retryDelay}s..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $retryDelay
+            }
+            else {
+                throw
+            }
         }
     }
-
-    return $result
 }
 
 # start an async run-command to monitor the target table and ingest any missing log file entries
@@ -1052,6 +1082,7 @@ function main {
 
 
     foreach ($vm in $VmList) {
+        $serverStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $subscriptionId = $vm[0]
         $resourceGroup = $vm[1]
         $machine = $vm[2]
@@ -1059,9 +1090,11 @@ function main {
         $workspaceName = $vm[4]
         $tableName = $vm[5]
 
-        Set-AzContext -Subscription $subscriptionId
+        $tenantId = (Get-AzSubscription -SubscriptionId $subscriptionId -WarningAction SilentlyContinue).TenantId
+        Set-AzContext -Subscription $subscriptionId -TenantId $tenantId -WarningAction SilentlyContinue | Out-Null
 
-        Write-Host "Processing Azure Windows VM: $machine in Resource Group: $resourceGroup under Subscription: $subscriptionId" -ForegroundColor Green
+        $vmTypeLabel = "$(if ($IsArcConnectedMachine) { 'Arc' } else { 'Azure' }) $(if ($IsLinuxVm) { 'Linux' } else { 'Windows' })"
+        Write-Host "Processing ${vmTypeLabel} VM: $machine in Resource Group: $resourceGroup under Subscription: $subscriptionId" -ForegroundColor Green
 
         # make big command as run-command is expensive, so do once per server
         $cmds = ""
@@ -1121,12 +1154,17 @@ function main {
 
         # convert the multiline string returned to an array
         # Value[0] is StdOut on Windows. 
-        # On Linux I bleieve its all combined so just ignore results that do not start with a /
+        # On Linux I believe its all combined so just ignore results that do not start with a /
         if ($IsTestingMode -eq $false) {
+            if ($null -eq $result -or $null -eq $result.Value -or $result.Value.Count -eq 0) {
+                Write-Host "No output returned from Run Command on VM ${machine}. Skipping." -ForegroundColor Yellow
+                continue
+            }
             $resultArr = $result.Value[0].Message -split "`n"
         }
 
         $matchedFolders = @()
+        $debugMatchDetails = @{}
         foreach ($candidateLineRaw in ($resultArr | Select-Object -Unique)) {
             $candidateLine = $candidateLineRaw.Trim()
 
@@ -1149,20 +1187,50 @@ function main {
                     continue
                 }
 
+                $resolvedFolder = $null
                 if ($candidateType -eq 'd') {
                     $matchedFolders += $candidatePath
+                    $resolvedFolder = $candidatePath
                 }
                 elseif ($candidateType -eq 'f') {
                     $parentFolder = Get-ParentFolderPath -Path $candidatePath -IsLinuxVm $IsLinuxVm
                     if ($null -ne $parentFolder) {
                         $matchedFolders += $parentFolder
+                        $resolvedFolder = $parentFolder
+                    }
+                }
+
+                if ($IsDebugLoggingEnabled -and $null -ne $resolvedFolder) {
+                    if (-not $debugMatchDetails.ContainsKey($resolvedFolder)) {
+                        $debugMatchDetails[$resolvedFolder] = @()
+                    }
+                    if ($debugMatchDetails[$resolvedFolder] -notcontains $wildcardPath) {
+                        $debugMatchDetails[$resolvedFolder] += $wildcardPath
                     }
                 }
             }
         }
 
         # keep the unique entries in the array
-        $resultArrUnique = $matchedFolders | Select-Object -Unique
+        $resultArrUnique = @($matchedFolders | Select-Object -Unique)
+
+        if ($IsDebugLoggingEnabled) {
+            Write-Host "`n[DEBUG] Folder match summary for server: $machine" -ForegroundColor DarkYellow
+            if ($resultArrUnique.Count -eq 0) {
+                Write-Host "  (no matching folders found)" -ForegroundColor DarkGray
+            }
+            else {
+                foreach ($debugFolder in $resultArrUnique) {
+                    Write-Host "  Folder: $debugFolder" -ForegroundColor DarkCyan
+                    if ($debugMatchDetails.ContainsKey($debugFolder)) {
+                        foreach ($debugPattern in $debugMatchDetails[$debugFolder]) {
+                            Write-Host "    Matched pattern: $debugPattern" -ForegroundColor DarkGray
+                        }
+                    }
+                }
+            }
+            Write-Host ""
+        }
 
         foreach ($folder in $resultArrUnique) {
 
@@ -1214,8 +1282,9 @@ function main {
                     -tableName $tableName
 
                 if ($dcr) {
-                    # lookup the workspace immutable id based on the name and resourcegroup
-                    $workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName $dcrResourceGroup -Name $workspaceName
+                    # lookup the workspace immutable id - resolve the actual workspace resource group
+                    $workspaceResource = @(Get-AzResource -ResourceType "Microsoft.OperationalInsights/workspaces" -Name $workspaceName -ErrorAction Stop) | Select-Object -First 1
+                    $workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName $workspaceResource.ResourceGroupName -Name $workspaceName
                     $workspaceId = $workspace.CustomerId
 
                     # lookup the DCE endpoint
@@ -1248,6 +1317,11 @@ function main {
                     -maxRetries $maxRetries `
                 }
             }
+        }
+
+        if ($IsDebugLoggingEnabled) {
+            $serverStopwatch.Stop()
+            Write-Host "[DEBUG] Server $machine processed in $($serverStopwatch.Elapsed.ToString('mm\:ss\.ff'))" -ForegroundColor DarkYellow
         }
     }
 }
