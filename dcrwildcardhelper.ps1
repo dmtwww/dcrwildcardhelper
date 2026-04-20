@@ -975,10 +975,10 @@ function main {
             }
 
             # New-AzConnectedMachineRunCommand returns InstanceViewOutput; Invoke-AzVMRunCommand returns Value[0].Message
-            if ($null -ne $result.InstanceViewOutput) {
+            if ($result.PSObject.Properties.Match('InstanceViewOutput').Count -gt 0 -and $null -ne $result.InstanceViewOutput) {
                 $resultArr = $result.InstanceViewOutput -split "`n"
             }
-            elseif ($null -ne $result.Value -and $result.Value.Count -gt 0) {
+            elseif ($result.PSObject.Properties.Match('Value').Count -gt 0 -and $null -ne $result.Value -and $result.Value.Count -gt 0) {
                 $resultArr = $result.Value[0].Message -split "`n"
             }
             else {
