@@ -664,6 +664,10 @@ function RunCommand {
             $commandId = if ($IsLinuxVm) { 'RunShellScript' } else { 'RunPowerShellScript' }
 
             if ($IsArcConnectedMachine) {
+                $arcRes = Get-AzResource -ResourceGroupName $ResourceGroupName -ResourceName $VMName -ResourceType "Microsoft.HybridCompute/machines" -ErrorAction SilentlyContinue
+                if ($null -eq $arcRes) {
+                    throw "Arc machine '$VMName' not found in resource group '$ResourceGroupName'. Verify it is registered in Azure Arc."
+                }
                 $runCmdName = "runcmd-$VMName-$(Get-Date -Format 'HHmmss')"
                 $asyncParams = @{}
                 if ($IsAsync) { $asyncParams['AsJob'] = $true }
@@ -671,7 +675,7 @@ function RunCommand {
                     -ResourceGroupName $ResourceGroupName `
                     -MachineName $VMName `
                     -RunCommandName $runCmdName `
-                    -Location $dcrLocation `
+                    -Location $arcRes.Location `
                     -SourceScript $ScriptString `
                     @asyncParams
             }
@@ -874,12 +878,20 @@ function main {
                 try {
                     Write-Host "  Submitting discovery job for $machine" -ForegroundColor Green
                     if ($IsArcConnectedMachine) {
+                        # Resolve the Arc machine resource to get its actual location
+                        $arcResource = Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.HybridCompute/machines" -ErrorAction SilentlyContinue
+                        if ($null -eq $arcResource) {
+                            Write-Host "  ERROR: Arc machine '$machine' not found in resource group '$resourceGroup' (subscription $subId). Verify it is registered in Azure Arc and the CSV has the correct name/RG." -ForegroundColor Red
+                            $discoveryEntries += @{ Job = $null; Vm = $vm }
+                            continue
+                        }
+                        $arcLocation = $arcResource.Location
                         $runCmdName = "discover-$($machine)-$(Get-Date -Format 'HHmmss')"
                         $job = New-AzConnectedMachineRunCommand `
                             -ResourceGroupName $resourceGroup `
                             -MachineName $machine `
                             -RunCommandName $runCmdName `
-                            -Location $dcrLocation `
+                            -Location $arcLocation `
                             -SourceScript $cmds `
                             -AsJob
                     }
@@ -1046,9 +1058,19 @@ function main {
 
         # Resolve per-VM resources once before iterating folders
         if ($IsArcConnectedMachine -eq $true) {
-            $vmResourceId = (Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.HybridCompute/machines").ResourceId
+            $vmResource = Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.HybridCompute/machines" -ErrorAction SilentlyContinue
+            if ($null -eq $vmResource) {
+                Write-Host "ERROR: Arc machine '$machine' not found in resource group '$resourceGroup' (subscription $subscriptionId). Verify it is registered in Azure Arc and the CSV has the correct name/RG. Skipping." -ForegroundColor Red
+                continue
+            }
+            $vmResourceId = $vmResource.ResourceId
         } else {
-            $vmResourceId = (Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.Compute/virtualMachines").ResourceId
+            $vmResource = Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.Compute/virtualMachines" -ErrorAction SilentlyContinue
+            if ($null -eq $vmResource) {
+                Write-Host "ERROR: Azure VM '$machine' not found in resource group '$resourceGroup' (subscription $subscriptionId). Skipping." -ForegroundColor Red
+                continue
+            }
+            $vmResourceId = $vmResource.ResourceId
         }
         $workspaceResource = @(Get-AzResource -ResourceType "Microsoft.OperationalInsights/workspaces" -Name $workspaceName -ErrorAction Stop) | Select-Object -First 1
         $workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName $workspaceResource.ResourceGroupName -Name $workspaceName
