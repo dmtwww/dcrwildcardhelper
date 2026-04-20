@@ -1,4 +1,4 @@
-# Enable strict mode to enforce variable declaration
+﻿# Enable strict mode to enforce variable declaration
 Set-StrictMode -Version Latest
 
 # Load configuration from JSON file
@@ -467,7 +467,7 @@ RESPONSE=`$(curl -s -H "Metadata: true" -H "Authorization: Basic `$SECRET" "`$EN
     }
     else {
         $script += @"
-RESPONSE=`$(curl -s -H "Metadata: true" "`$ENDPOINT")`
+RESPONSE=`$(curl -s -H "Metadata: true" "`$ENDPOINT")
 "@
     }
 
@@ -895,7 +895,14 @@ function main {
         $runningJobs = @($discoveryEntries | Where-Object { $null -ne $_.Job } | ForEach-Object { $_.Job })
         if ($runningJobs.Count -gt 0) {
             Write-Host "`nWaiting for $($runningJobs.Count) discovery job(s) to complete..." -ForegroundColor Cyan
-            $runningJobs | Wait-Job | Out-Null
+            $totalJobs = $runningJobs.Count
+            while ($true) {
+                $stillRunning = @($runningJobs | Where-Object { $_.State -eq 'Running' })
+                if ($stillRunning.Count -eq 0) { break }
+                $doneCount = $totalJobs - $stillRunning.Count
+                Write-Host "  Progress: $doneCount/$totalJobs jobs completed, $($stillRunning.Count) still running..." -ForegroundColor DarkCyan
+                Start-Sleep -Seconds 15
+            }
             $completedCount = @($runningJobs | Where-Object { $_.State -eq 'Completed' }).Count
             $failedCount = $runningJobs.Count - $completedCount
             Write-Host "Discovery complete: $completedCount succeeded, $failedCount failed." -ForegroundColor Green
