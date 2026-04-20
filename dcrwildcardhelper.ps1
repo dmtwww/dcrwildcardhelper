@@ -1,6 +1,18 @@
 ﻿# Enable strict mode to enforce variable declaration
 Set-StrictMode -Version Latest
 
+# Validate required Az modules are available
+$requiredModules = @('Az.Accounts', 'Az.Resources', 'Az.Monitor', 'Az.OperationalInsights', 'Az.ConnectedMachine')
+$missingModules = @()
+foreach ($mod in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $mod)) {
+        $missingModules += $mod
+    }
+}
+if ($missingModules.Count -gt 0) {
+    throw "Missing required PowerShell modules: $($missingModules -join ', '). Install them with: Install-Module $($missingModules -join ', ') -Force"
+}
+
 # Load configuration from JSON file
 $configPath = Join-Path $PSScriptRoot "dcrwildcardhelper.config.json"
 if (-not (Test-Path $configPath)) {
