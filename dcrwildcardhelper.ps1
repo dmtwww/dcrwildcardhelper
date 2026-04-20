@@ -668,7 +668,7 @@ function RunCommand {
                 if ($null -eq $arcRes) {
                     throw "Arc machine '$VMName' not found in resource group '$ResourceGroupName'. Verify it is registered in Azure Arc."
                 }
-                $runCmdName = "runcmd-$VMName-$(Get-Date -Format 'HHmmss')"
+                $runCmdName = "runcmd-$(Get-Date -Format 'HHmmss')"
                 $asyncParams = @{}
                 if ($IsAsync) { $asyncParams['AsJob'] = $true }
                 $result = New-AzConnectedMachineRunCommand `
@@ -886,7 +886,7 @@ function main {
                             continue
                         }
                         $arcLocation = $arcResource.Location
-                        $runCmdName = "discover-$($machine)-$(Get-Date -Format 'HHmmss')"
+                        $runCmdName = "discover-$(Get-Date -Format 'HHmmss')"
                         $job = New-AzConnectedMachineRunCommand `
                             -ResourceGroupName $resourceGroup `
                             -MachineName $machine `
@@ -1165,4 +1165,3 @@ if ($connectedMachinesAndVmsHash["ArcWindowsVMs"].Count -gt 0) {
 if ($connectedMachinesAndVmsHash["AzureWindowsVMs"].Count -gt 0) {
     main -SplunkWildcardPaths $windowsAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureWindowsVMs"] -IsArcConnectedMachine $false -IsLinuxVm $false
 }
-
