@@ -663,22 +663,17 @@ function RunCommand {
         try {
             $commandId = if ($IsLinuxVm) { 'RunShellScript' } else { 'RunPowerShellScript' }
 
-            if ($IsArcConnectedMachine -and $IsAsync) {
+            if ($IsArcConnectedMachine) {
+                $runCmdName = "runcmd-$VMName-$(Get-Date -Format 'HHmmss')"
+                $asyncParams = @{}
+                if ($IsAsync) { $asyncParams['AsJob'] = $true }
                 $result = New-AzConnectedMachineRunCommand `
                     -ResourceGroupName $ResourceGroupName `
                     -MachineName $VMName `
+                    -RunCommandName $runCmdName `
                     -Location $dcrLocation `
-                    -RunCommandName "ArcRunCmd" `
                     -SourceScript $ScriptString `
-                    -AsJob
-            }
-            elseif ($IsArcConnectedMachine) {
-                $result = Invoke-AzConnectedMachineRunCommand `
-                    -ResourceGroupName $ResourceGroupName `
-                    -MachineName $VMName `
-                    -CommandId $commandId `
-                    -ScriptString $ScriptString `
-                    -ErrorAction Stop
+                    @asyncParams
             }
             elseif ($IsAsync) {
                 $result = Invoke-AzVMRunCommand `
@@ -879,11 +874,13 @@ function main {
                 try {
                     Write-Host "  Submitting discovery job for $machine" -ForegroundColor Green
                     if ($IsArcConnectedMachine) {
-                        $job = Invoke-AzConnectedMachineRunCommand `
+                        $runCmdName = "discover-$($machine)-$(Get-Date -Format 'HHmmss')"
+                        $job = New-AzConnectedMachineRunCommand `
                             -ResourceGroupName $resourceGroup `
                             -MachineName $machine `
-                            -CommandId $commandId `
-                            -ScriptString $cmds `
+                            -RunCommandName $runCmdName `
+                            -Location $dcrLocation `
+                            -SourceScript $cmds `
                             -AsJob
                     }
                     else {
@@ -965,11 +962,17 @@ function main {
                 Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
             }
 
-            if ($null -eq $result -or $null -eq $result.Value -or $result.Value.Count -eq 0) {
+            # New-AzConnectedMachineRunCommand returns InstanceViewOutput; Invoke-AzVMRunCommand returns Value[0].Message
+            if ($null -ne $result.InstanceViewOutput) {
+                $resultArr = $result.InstanceViewOutput -split "`n"
+            }
+            elseif ($null -ne $result.Value -and $result.Value.Count -gt 0) {
+                $resultArr = $result.Value[0].Message -split "`n"
+            }
+            else {
                 Write-Host "No output returned from discovery on VM ${machine}. Skipping." -ForegroundColor Yellow
                 continue
             }
-            $resultArr = $result.Value[0].Message -split "`n"
         }
 
         # Match discovered paths against Splunk wildcard patterns
