@@ -896,6 +896,7 @@ function main {
                             -AsJob
                     }
                     else {
+                        $runCmdName = $null
                         $job = Invoke-AzVMRunCommand `
                             -ResourceGroupName $resourceGroup `
                             -VMName $machine `
@@ -903,7 +904,7 @@ function main {
                             -ScriptString $cmds `
                             -AsJob
                     }
-                    $discoveryEntries += @{ Job = $job; Vm = $vm }
+                    $discoveryEntries += @{ Job = $job; Vm = $vm; IsArc = $IsArcConnectedMachine; RunCmdName = $runCmdName; ResourceGroup = $resourceGroup }
                 }
                 catch {
                     Write-Host "  Error submitting discovery for ${machine}: $_" -ForegroundColor Red
@@ -913,20 +914,79 @@ function main {
         }
 
         # Wait for all discovery jobs to complete
-        $runningJobs = @($discoveryEntries | Where-Object { $null -ne $_.Job } | ForEach-Object { $_.Job })
-        if ($runningJobs.Count -gt 0) {
-            Write-Host "`nWaiting for $($runningJobs.Count) discovery job(s) to complete..." -ForegroundColor Cyan
-            $totalJobs = $runningJobs.Count
+        $jobEntries = @($discoveryEntries | Where-Object { $null -ne $_.Job })
+        if ($jobEntries.Count -gt 0) {
+            Write-Host "`nWaiting for $($jobEntries.Count) discovery job(s) to complete..." -ForegroundColor Cyan
+            $totalJobs = $jobEntries.Count
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $lastDoneCount = -1
+            $reportedCompleted = @{}
             while ($true) {
-                $stillRunning = @($runningJobs | Where-Object { $_.State -eq 'Running' })
-                if ($stillRunning.Count -eq 0) { break }
-                $doneCount = $totalJobs - $stillRunning.Count
-                Write-Host "  Progress: $doneCount/$totalJobs jobs completed, $($stillRunning.Count) still running..." -ForegroundColor DarkCyan
+                $stillRunningEntries = @($jobEntries | Where-Object { $_.Job.State -eq 'Running' })
+                if ($stillRunningEntries.Count -eq 0) { break }
+                $doneCount = $totalJobs - $stillRunningEntries.Count
+                $elapsed = $stopwatch.Elapsed.ToString('mm\:ss')
+                # Report newly completed/failed jobs once
+                foreach ($entry in $jobEntries) {
+                    $vmName = $entry.Vm[2]
+                    if ($entry.Job.State -ne 'Running' -and -not $reportedCompleted.ContainsKey($vmName)) {
+                        $state = $entry.Job.State
+                        $color = if ($state -eq 'Completed') { 'Green' } else { 'Red' }
+                        Write-Host "    $vmName -> $state" -ForegroundColor $color
+                        if ($state -eq 'Failed') {
+                            $childJob0 = if ($entry.Job.ChildJobs -and $entry.Job.ChildJobs.Count -gt 0) { $entry.Job.ChildJobs[0] } else { $null }
+                            if ($childJob0) {
+                                $childErr = $childJob0.Error | Select-Object -First 2
+                                foreach ($e in $childErr) { Write-Host "      Error: $e" -ForegroundColor Red }
+                            }
+                        }
+                        $reportedCompleted[$vmName] = $true
+                    }
+                }
+                # Show per-VM debug details for still-running jobs
+                foreach ($entry in $stillRunningEntries) {
+                    $vmName = $entry.Vm[2]
+                    $childJob = if ($entry.Job.ChildJobs -and $entry.Job.ChildJobs.Count -gt 0) { $entry.Job.ChildJobs[0] } else { $null }
+                    $childState = if ($childJob) { $childJob.State } else { 'N/A' }
+                    $typeLabel = if ($entry.IsArc) { 'Arc' } else { 'Azure' }
+                    $detail = "  [$elapsed] $vmName ($typeLabel): JobState=$($entry.Job.State), ChildState=$childState"
+                    # Check for any progress records from the child job
+                    if ($childJob -and $childJob.Progress.Count -gt 0) {
+                        $lastProgress = $childJob.Progress[$childJob.Progress.Count - 1]
+                        $detail += ", Activity=$($lastProgress.Activity), Status=$($lastProgress.StatusDescription)"
+                        if ($lastProgress.PercentComplete -ge 0) { $detail += " ($($lastProgress.PercentComplete)%)" }
+                    }
+                    # Check for any warnings
+                    if ($childJob -and $childJob.Warning.Count -gt 0) {
+                        $lastWarn = $childJob.Warning[$childJob.Warning.Count - 1]
+                        $detail += ", Warning=$lastWarn"
+                    }
+                    # For Arc VMs, query the run command provisioning state
+                    if ($entry.IsArc -and $entry.RunCmdName) {
+                        try {
+                            $rcStatus = Get-AzConnectedMachineRunCommand -ResourceGroupName $entry.ResourceGroup -MachineName $vmName -RunCommandName $entry.RunCmdName -ErrorAction SilentlyContinue
+                            if ($rcStatus) {
+                                $detail += ", ProvisioningState=$($rcStatus.ProvisioningState)"
+                                if ($rcStatus.InstanceViewExecutionState) { $detail += ", ExecState=$($rcStatus.InstanceViewExecutionState)" }
+                            }
+                        } catch { }
+                    }
+                    Write-Host $detail -ForegroundColor DarkCyan
+                }
                 Start-Sleep -Seconds 15
             }
-            $completedCount = @($runningJobs | Where-Object { $_.State -eq 'Completed' }).Count
-            $failedCount = $runningJobs.Count - $completedCount
-            Write-Host "Discovery complete: $completedCount succeeded, $failedCount failed." -ForegroundColor Green
+            $stopwatch.Stop()
+            $totalElapsed = $stopwatch.Elapsed.ToString('mm\:ss')
+            $completedCount = @($jobEntries | Where-Object { $_.Job.State -eq 'Completed' }).Count
+            $failedCount = $jobEntries.Count - $completedCount
+            # Show final status per VM
+            foreach ($entry in $jobEntries) {
+                $vmName = $entry.Vm[2]
+                $state = $entry.Job.State
+                $color = if ($state -eq 'Completed') { 'Green' } else { 'Red' }
+                Write-Host "    $vmName -> $state" -ForegroundColor $color
+            }
+            Write-Host "Discovery complete in $totalElapsed : $completedCount succeeded, $failedCount failed." -ForegroundColor Green
         }
     }
 
