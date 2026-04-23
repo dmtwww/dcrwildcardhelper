@@ -1246,14 +1246,22 @@ function main {
 $connectedMachinesAndVmsHash = Get-VMListsFromCSV -CsvPath $config.csvPath
 
 # entry point for Azure Linux VMs
-#main -SplunkWildcardPaths $linuxAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureLinuxVMs"] -IsArcConnectedMachine $false -IsLinuxVm $true
+if ($connectedMachinesAndVmsHash["AzureLinuxVMs"].Count -gt 0) {
+    main -SplunkWildcardPaths $linuxAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureLinuxVMs"] -IsArcConnectedMachine $false -IsLinuxVm $true
+}
 
 # Entry point for Arc Linux VMs
-main -SplunkWildcardPaths $linuxArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcLinuxVMs"]  -IsArcConnectedMachine $true -IsLinuxVm $true
+if ($connectedMachinesAndVmsHash["ArcLinuxVMs"].Count -gt 0) {
+    main -SplunkWildcardPaths $linuxArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcLinuxVMs"]  -IsArcConnectedMachine $true -IsLinuxVm $true
+}
 
 # Entry point for Arc Windows VMs
-#main -SplunkWildcardPaths $windowsArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcWindowsVMs"] -IsArcConnectedMachine $true -IsLinuxVm $false
+if ($connectedMachinesAndVmsHash["ArcWindowsVMs"].Count -gt 0) {
+    main -SplunkWildcardPaths $windowsArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcWindowsVMs"] -IsArcConnectedMachine $true -IsLinuxVm $false
+}
 
 # Entry point for Azure Windows VMs
-#main -SplunkWildcardPaths $windowsAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureWindowsVMs"] -IsArcConnectedMachine $false -IsLinuxVm $false
+if ($connectedMachinesAndVmsHash["AzureWindowsVMs"].Count -gt 0) {
+    main -SplunkWildcardPaths $windowsAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureWindowsVMs"] -IsArcConnectedMachine $false -IsLinuxVm $false
+}
 
