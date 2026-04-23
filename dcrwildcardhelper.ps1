@@ -1,43 +1,94 @@
-﻿# Enable strict mode to enforce variable declaration
+# Enable strict mode to enforce variable declaration
 Set-StrictMode -Version Latest
-
-# Validate required Az modules are available
-$requiredModules = @('Az.Accounts', 'Az.Resources', 'Az.Monitor', 'Az.OperationalInsights', 'Az.ConnectedMachine')
-$missingModules = @()
-foreach ($mod in $requiredModules) {
-    if (-not (Get-Module -ListAvailable -Name $mod)) {
-        $missingModules += $mod
-    }
-}
-if ($missingModules.Count -gt 0) {
-    throw "Missing required PowerShell modules: $($missingModules -join ', '). Install them with: Install-Module $($missingModules -join ', ') -Force"
-}
 
 # Load configuration from JSON file
 $configPath = Join-Path $PSScriptRoot "dcrwildcardhelper.config.json"
 if (-not (Test-Path $configPath)) {
     throw "Configuration file not found: $configPath"
 }
+
 $config = Get-Content $configPath -Raw | ConvertFrom-Json
 
+# In testing mode speed things up by not calling run-command first time
 $IsTestingMode = $config.isTestingMode
 $IsDebugLoggingEnabled = $config.isDebugLoggingEnabled
 
-# Splunk wildcard patterns per platform
+# these are the RegEx equivalents of the original Splunk wildcards
+# Splunk wildcards are proprietary as are DCR wildcards
+# for example Splunk '/var/.../*.log' becomes '/var/.*/[^/]+.log' in RegEx and '/var/myparentfolder/myfolder*/*.log in DCR (multiple potentially required) 
+# for example Splunk '/var/*/*.log' becomes '/var/[^/]+/[^/]+.log' in RegEx and '/var/myfolder*/*.log' in DCR (multiple potentially required)
 $linuxAzureSplunkWildcardPatterns = @($config.linuxAzureSplunkWildcardPatterns)
+
 $linuxArcSplunkWildcardPatterns = @($config.linuxArcSplunkWildcardPatterns)
+
+# Define the Windows paths
 $windowsArcSplunkWildcardPatterns = @($config.windowsArcSplunkWildcardPatterns)
+
 $windowsAzureSplunkWildcardPatterns = @($config.windowsAzureSplunkWildcardPatterns)
 
+# location for the DCRs
 $dcrLocation = $config.dcrLocation
+# storage account for scripts and script logs
 $scriptStorageAccount = $config.scriptStorageAccount
+# container name for scripts and script logs
 $scriptContainerName = $config.scriptContainerName
+
+# TODO make this a parameter
 $dcrResourceGroup = $config.dcrResourceGroup
 
-$maxFilePatternsPerDcr = $config.maxFilePatternsPerDcr
-$maxParallelJobs = $config.maxParallelJobs
 $sleepTime = $config.sleepTime
 $maxRetries = $config.maxRetries
+
+function Format-ElapsedTime {
+    param (
+        [System.Diagnostics.Stopwatch]$Stopwatch
+    )
+
+    if ($null -eq $Stopwatch) {
+        return "00:00:00"
+    }
+
+    return $Stopwatch.Elapsed.ToString('hh\:mm\:ss')
+}
+
+function Write-PhaseLog {
+    param (
+        [string]$VMName,
+        [string]$Phase,
+        [System.Diagnostics.Stopwatch]$Stopwatch,
+        [string]$Color = 'Cyan'
+    )
+
+    Write-Host "[$(Format-ElapsedTime -Stopwatch $Stopwatch)] [$VMName] $Phase" -ForegroundColor $Color
+}
+
+function Set-AzContextForSubscription {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$SubscriptionId
+    )
+
+    try {
+        Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null
+        return
+    }
+    catch {
+        $tenantId = $null
+
+        try {
+            $tenantId = az account show --subscription $SubscriptionId --query tenantId -o tsv 2>$null
+        }
+        catch {
+            $tenantId = $null
+        }
+
+        if ([string]::IsNullOrWhiteSpace($tenantId)) {
+            throw
+        }
+
+        Set-AzContext -Subscription $SubscriptionId -Tenant $tenantId -ErrorAction Stop | Out-Null
+    }
+}
 
 # Function to read CSV and populate VM lists
 function Get-VMListsFromCSV {
@@ -46,250 +97,286 @@ function Get-VMListsFromCSV {
         [string]$CsvPath
     )
 
-    $result = @{ ArcWindowsVMs = @(); ArcLinuxVMs = @(); AzureWindowsVMs = @(); AzureLinuxVMs = @() }
+    # Initialize the four arrays
+    $arcWindowsVMs = @()
+    $arcLinuxVMs = @()
+    $azureWindowsVMs = @()
+    $azureLinuxVMs = @()
 
-    foreach ($row in (Import-Csv -Path $CsvPath)) {
-        $vmEntry = @($row.SubscriptionId, $row.ResourceGroup, $row.VMName, $row.DCEName, $row.WorkspaceName, $row.TableName)
-        $platform = if ($row.ArcAzure -eq "Arc") { "Arc" } else { "Azure" }
-        $os = if ($row.WindowsLinux -eq "Windows") { "Windows" } else { "Linux" }
-        $result["${platform}${os}VMs"] += ,@($vmEntry)
-    }
+    # Read the CSV file
+    $csvData = Import-Csv -Path $CsvPath
 
-    return $result
-}
+    foreach ($row in $csvData) {
+        # Create an array for this VM: SubscriptionId, ResourceGroup, VMName, DCEName, WorkspaceName, TableName
+        $vmEntry = @(
+            $row.SubscriptionId,
+            $row.ResourceGroup,
+            $row.VMName,
+            $row.DCEName,
+            $row.WorkspaceName,
+            $row.TableName
+        )
 
-function Get-SplunkPathSeparator {
-    param (
-        [bool]$IsLinuxVm
-    )
+        # Determine which list to add to based on IsArc and IsLinux columns
+        $isArc = [bool]::Parse($row.ArcAzure.Equals("Arc", [System.StringComparison]::OrdinalIgnoreCase))
+        $isDeviceWindows = [bool]::Parse($row.WindowsLinux.Equals("Windows", [System.StringComparison]::OrdinalIgnoreCase))
 
-    if ($IsLinuxVm) {
-        return '/'
-    }
-
-    return '\'
-}
-
-function Get-SplunkPathSegments {
-    param (
-        [string]$Path,
-        [bool]$IsLinuxVm
-    )
-
-    $separator = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
-    return @($Path -split [regex]::Escape($separator))
-}
-
-function Test-SplunkSegmentHasWildcard {
-    param (
-        [string]$Segment
-    )
-
-    return $Segment -eq '...' -or $Segment.IndexOf('*') -ge 0 -or $Segment.IndexOf('?') -ge 0
-}
-
-function Test-SplunkPatternHasWildcard {
-    param (
-        [string]$Pattern,
-        [bool]$IsLinuxVm
-    )
-
-    foreach ($segment in (Get-SplunkPathSegments -Path $Pattern -IsLinuxVm $IsLinuxVm)) {
-        if (Test-SplunkSegmentHasWildcard -Segment $segment) {
-            return $true
+        if ($isArc -and -not $isDeviceWindows) {
+            $arcLinuxVMs += ,@($vmEntry)
+        }
+        elseif ($isArc -and $isDeviceWindows) {
+            $arcWindowsVMs += ,@($vmEntry)
+        }
+        elseif (-not $isArc -and -not $isDeviceWindows) {
+            $azureLinuxVMs += ,@($vmEntry)
+        }
+        else {
+            $azureWindowsVMs += ,@($vmEntry)
         }
     }
 
-    return $false
+    # Return a hashtable with all four lists
+    return @{
+        ArcWindowsVMs = $arcWindowsVMs
+        ArcLinuxVMs = $arcLinuxVMs
+        AzureWindowsVMs = $azureWindowsVMs
+        AzureLinuxVMs = $azureLinuxVMs
+    }
 }
 
 function Convert-SplunkWildcardToRegex {
     param (
         [Parameter(Mandatory = $true)]
         [string]$Pattern,
-        [bool]$IsLinuxVm
+        [Parameter(Mandatory = $true)]
+        [bool]$IsLinuxVm = $true
     )
 
-    $separator = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
-    $sepRx = [regex]::Escape($separator)
-    $segPlus = if ($IsLinuxVm) { '[^/]+' } else { '[^\\]+' }
-    $segStar = if ($IsLinuxVm) { '[^/]*' } else { '[^\\]*' }
-    $charAny = if ($IsLinuxVm) { '[^/]' } else { '[^\\]' }
-    $segments = Get-SplunkPathSegments -Path $Pattern -IsLinuxVm $IsLinuxVm
-    $hasLeadingSep = $IsLinuxVm -and $Pattern.StartsWith($separator)
+    # Replace escaped Splunk wildcards with regex equivalents.
+    # Protect the recursive ellipsis token first so the '*' in '.*' is not rewritten below.
+    $recursivePlaceholder = '__SPLUNK_ELLIPSIS__'
+    $regexPattern = $Pattern -replace '\.\.\.', $recursivePlaceholder
 
-    $rx = [System.Text.StringBuilder]::new()
-    [void]$rx.Append('^')
-    if ($hasLeadingSep) { [void]$rx.Append($sepRx) }
+    if ($IsLinuxVm -eq $true) {
+        $regexPattern = $regexPattern -replace '\*', '[^/]+'      # '*' → '[^/]+'
+    }
+    else {
+        # double backslashes for Windows
+        $regexPattern = $regexPattern -replace '\\', '\\'      # '\' → '\\'
+        $regexPattern = $regexPattern -replace '\*', '[^\\]+'      # '*' → '[^/]+'
+    }
 
-    $emitted = $false
-    foreach ($seg in $segments) {
-        if ([string]::IsNullOrEmpty($seg)) { continue }
+    $regexPattern = $regexPattern -replace $recursivePlaceholder, '.*'      # '...' → '.*'
 
-        if ($seg -eq '...') {
-            if ($emitted -or $hasLeadingSep) {
-                [void]$rx.Append("(?:$sepRx$segPlus)+")
-            } else {
-                [void]$rx.Append("(?:$segPlus$sepRx)+")
-            }
-            $emitted = $true
+    # Return the final regex pattern
+    return $regexPattern
+}
+
+# Make a name from a wildcard path by stripping out any wildcard characters
+# and prepending dcr_ to the name
+function Get-DcrNameFromWildcard {
+    param (
+        [string]$WildcardPathname
+    )
+
+    $dcrName = $WildcardPathname -replace '[\*\?\[\]\^\.\:\\/]', '_'
+    $dcrName = "dcr_" + $dcrName
+
+    $maxLength = 64
+    if ($dcrName.Length -gt $maxLength) {
+        $hashBytes = [System.Security.Cryptography.MD5]::HashData([System.Text.Encoding]::UTF8.GetBytes($WildcardPathname))
+        $hash = ([System.BitConverter]::ToString($hashBytes)).Replace('-', '').Substring(0, 8).ToLowerInvariant()
+        $prefixLength = $maxLength - $hash.Length - 1
+        $dcrName = $dcrName.Substring(0, $prefixLength) + "_" + $hash
+    }
+
+    return $dcrName
+}
+
+# Get the DCR Folder Path for a given VM Resource Id and Folder
+function Get-DcrFolderPath {
+    param (
+        [string]$VmResourceId,
+        [string]$Folder,
+        [bool]$IsLinuxVm = $true
+    )
+
+    $retDcrFolderPath = $null
+
+    # Is there a DCR Association for this VM
+    $dcrAssociationArr = @(Get-AzDataCollectionRuleAssociation -ResourceUri $VmResourceId)
+
+    foreach ($dcrAssociation in $dcrAssociationArr) {
+        $dcrId = $dcrAssociation.DataCollectionRuleId
+
+        if ($null -eq $dcrId) {
+            Write-Host "DCR for Assoc. $($dcrAssociation.Name) does not exist - skipping" -ForegroundColor Yellow
             continue
         }
 
-        if ($emitted) { [void]$rx.Append($sepRx) }
-
-        # Escape the whole segment, then swap escaped wildcards for regex equivalents
-        [void]$rx.Append([regex]::Escape($seg).Replace('\*', $segStar).Replace('\?', $charAny))
-        $emitted = $true
-    }
-
-    [void]$rx.Append('$')
-    return $rx.ToString()
-}
-
-function Test-SplunkPathMatch {
-    param (
-        [string]$Path,
-        [string]$Pattern,
-        [bool]$IsLinuxVm
-    )
-
-    $regexPattern = Convert-SplunkWildcardToRegex -Pattern $Pattern -IsLinuxVm $IsLinuxVm
-    return $Path -match $regexPattern
-}
-
-function Get-ParentFolderPath {
-    param (
-        [string]$Path,
-        [bool]$IsLinuxVm
-    )
-
-    $separator = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
-    $lastSeparatorIndex = $Path.LastIndexOf($separator)
-
-    if ($lastSeparatorIndex -lt 0) {
-        return $null
-    }
-
-    if ($lastSeparatorIndex -eq 0) {
-        return $separator
-    }
-
-    return $Path.Substring(0, $lastSeparatorIndex)
-}
-
-# Build the group DCR base name from location, OS, and table
-function Get-GroupDcrBaseName {
-    param (
-        [string]$Location,
-        [bool]$IsLinuxVm,
-        [string]$TableName
-    )
-    $os = if ($IsLinuxVm) { "linux" } else { "windows" }
-    return "dcr-$Location-$os-$TableName"
-}
-
-# Ensure file pattern exists in a group DCR and VM is associated.
-# Uses a shared $DcrCache hashtable (name → resource) to avoid redundant API calls.
-# Creates overflow DCRs when filePatterns exceed $maxFilePatternsPerDcr.
-function Ensure-GroupDcrPatternAndAssociation {
-    param (
-        [string]$FilePattern,
-        [string]$VmResourceId,
-        [bool]$IsLinuxVm,
-        [string]$SubscriptionId,
-        [string]$DcrResourceGroup,
-        [string]$DcrLocation,
-        [string]$DceName,
-        [string]$WorkspaceName,
-        [string]$TableName,
-        [hashtable]$DcrCache
-    )
-
-    $baseName = Get-GroupDcrBaseName -Location $DcrLocation -IsLinuxVm $IsLinuxVm -TableName $TableName
-    $targetDcr = $null
-    $dcrWithRoom = $null
-    $patternExists = $false
-
-    # Search cached group DCRs for this pattern or one with room
-    foreach ($dcrName in ($DcrCache.Keys | Where-Object { $_ -like "$baseName-*" } | Sort-Object)) {
-        $dcr = $DcrCache[$dcrName]
-        $logFiles = $dcr.Properties.dataSources.logFiles
-        if ($null -ne $logFiles) {
-            $patterns = @($logFiles[0].filePatterns)
-            if ($patterns -contains $FilePattern) {
-                $targetDcr = $dcr
-                $patternExists = $true
-                break
-            }
-            if ($null -eq $dcrWithRoom -and $patterns.Count -lt $maxFilePatternsPerDcr) {
-                $dcrWithRoom = $dcr
-            }
-        }
-    }
-
-    if (-not $patternExists) {
-        if ($null -ne $dcrWithRoom) {
-            # Add pattern to existing group DCR
-            $logFile = $dcrWithRoom.Properties.dataSources.logFiles[0]
-            $newPatterns = @($logFile.filePatterns) + @($FilePattern)
-            $dataSource = New-AzLogFilesDataSourceObject `
-                -Name $logFile.name `
-                -FilePattern $newPatterns `
-                -Stream $logFile.streams[0]
-            $null = Update-AzDataCollectionRule `
-                -Name $dcrWithRoom.Name `
-                -ResourceGroupName $dcrWithRoom.ResourceGroupName `
-                -SubscriptionId $SubscriptionId `
-                -DataSourceLogFile $dataSource
-            Write-Host "Added file pattern $FilePattern to DCR $($dcrWithRoom.Name)" -ForegroundColor Green
-            # Refresh cache
-            $targetDcr = Get-AzResource -ResourceId $dcrWithRoom.ResourceId
-            $DcrCache[$targetDcr.Name] = $targetDcr
+        if ($IsLinuxVm -eq $true) {
+            $folderSeparator = "/"
         }
         else {
-            # Create new group DCR (first or overflow)
-            $existingCount = @($DcrCache.Keys | Where-Object { $_ -like "$baseName-*" }).Count
-            $nextIndex = $existingCount + 1
-            $dcrName = "$baseName-$($nextIndex.ToString('000'))"
-            if ($nextIndex -gt 1) {
-                Write-Host "File pattern limit ($maxFilePatternsPerDcr) reached. Creating overflow DCR: $dcrName" -ForegroundColor Yellow
-            }
-            Write-Host "Creating group DCR: $dcrName with pattern $FilePattern" -ForegroundColor Yellow
-            $newDcr = New-DcrFromWildcard `
-                -dcrName $dcrName `
-                -dcrResourceGroupName $DcrResourceGroup `
-                -dcrSubscriptionId $SubscriptionId `
-                -dcrLocation $DcrLocation `
-                -dceName $DceName `
-                -customLogPath $FilePattern `
-                -tableName $TableName `
-                -workspaceName $WorkspaceName `
-                -isLinuxVm $IsLinuxVm
-            $targetDcr = Get-AzResource -ResourceId $newDcr.Id
-            $DcrCache[$targetDcr.Name] = $targetDcr
+            $folderSeparator = "\"  
         }
+
+        $dcr = Get-AzResource -ResourceId $dcrId
+
+        # Get the Data Sources from the DCR  
+        if ($dcr.Properties.dataSources.PSObject.Properties.Name.Equals("logFiles") -eq $false) {
+            Write-Host "DCR $($dcr.Name) has no Log File Data Sources - skipping" -ForegroundColor Yellow
+            continue
+        }
+
+        $logFileDataSourceArr = @($dcr.Properties.dataSources.logFiles) 
+        
+        foreach ($logFileDataSource in $logFileDataSourceArr) {
+
+            foreach ($filePattern in $logFileDataSource.filePatterns) {
+                Write-Host "Checking DCR File Pattern: $filePattern for VM $machine" -ForegroundColor Magenta
+
+                # if there are wildcards in the pattern then extract the folder part
+                # else the pattern is a folder only
+                if ($filePattern -match '[\*\?\[\.]') {
+                    $retDcrFolderPath = $filePattern.Substring(0, $filePattern.LastIndexOf($folderSeparator))
+                }
+                else {
+                    $retDcrFolderPath = $filePattern
+                }
+
+                if ($retDcrFolderPath -eq $Folder) {
+                    Write-Host "Found matching DCR File Pattern" -ForegroundColor Green
+                    return $retDcrFolderPath
+                }
+                else {                       
+                    $retDcrFolderPath = $null
+                }                      
+            }
+        }
+    }
+
+    return $retDcrFolderPath
+}
+
+# this function will ensure the DCR, Data Sourc, File Pattern and DCR Association exist
+# it is possible that some of these objects exist already, so lots of checks to see what is missing and create only that part
+function New-DcrDataSourceAndAssociation {
+    param (
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$dcrName,
+        [Parameter(Mandatory = $true)]
+        [string]$DcrFilePattern,
+        [Parameter(Mandatory = $true)]
+        [string]$vmResourceId,
+        [Parameter(Mandatory = $true)]
+        [bool]$IsLinuxVm,
+        [Parameter(Mandatory = $true)]
+        [string]$subscriptionId,
+        [Parameter(Mandatory = $true)]
+        [string]$dcrResourceGroup,
+        [Parameter(Mandatory = $true)]
+        [string]$dcrLocation,
+        [Parameter(Mandatory = $true)]
+        [string]$dceName,
+        [Parameter(Mandatory = $true)]
+        [string]$workspaceName,
+        [Parameter(Mandatory = $true)]
+        [string]$tableName
+        )
+
+    $retDcrResource = $null
+    $dcrCreated = $false
+    $associationCreated = $false
+    
+    $dcrResource = Get-AzResource -ResourceGroupName $dcrResourceGroup `
+                    -ResourceType "microsoft.insights/datacollectionrules" `
+                    -Name $dcrName `
+                    -ErrorAction SilentlyContinue
+
+    if ($null -eq $dcrResource) {
+        Write-Host "DCR $dcrName does not exist - creating it" -ForegroundColor Yellow
+        # create the DCR if it does not exist
+        $dcr = New-DcrFromWildcard `
+            -dcrName $dcrName `
+            -dcrResourceGroupName $dcrResourceGroup `
+            -dcrSubscriptionId $subscriptionId `
+            -dcrLocation $dcrLocation `
+            -dceName $dceName `
+            -customLogPath $dcrFilePattern `
+            -tableName $tableName `
+            -workspaceName $workspaceName `
+            -isLinuxVm $IsLinuxVm
+
+        if ($null -eq $dcr -or $dcr.PSObject.Properties.Match('Id').Count -eq 0 -or [string]::IsNullOrWhiteSpace($dcr.Id)) {
+            throw "Failed to create DCR '$dcrName' for file pattern '$DcrFilePattern'."
+        }
+
+        $retDcrResource = Get-AzResource -ResourceId $dcr.Id
+        $dcrCreated = $true
     }
     else {
-        Write-Host "File pattern $FilePattern already in DCR $($targetDcr.Name)" -ForegroundColor Green
-    }
+        # create the new Data Source
+        $incomingStream = "Custom-Stream"                 # incoming stream name
+        $dataSourceName = $DcrFilePattern + "-logfile"   # friendly name for this data source
 
-    # Ensure association (idempotent - catch conflict if already exists)
-    $assocName = "assoc-$($targetDcr.Name)"
-    try {
-        $null = New-AzDataCollectionRuleAssociation `
-            -AssociationName $assocName `
-            -ResourceUri $VmResourceId `
-            -DataCollectionRuleId $targetDcr.ResourceId
-    }
-    catch {
-        # Association already exists or is being updated - ignore conflict
-        if ($_.Exception.Message -notmatch 'already exists|Conflict|same association') {
-            throw
+        # Cannot have more than one Data Source object of a given type (eg Log File)
+        # So in this case need to add an extra File Pattern to an exisiting data source object
+        if ($null -ne $dcrResource.Properties.dataSources.logFiles) {
+            # the Log Files data source already exists - recreate the object appending the new file pattern
+            $exisitingDataSourceLogFiles = $dcrResource.Properties.dataSources.logFiles[0]
+
+            if ($exisitingDataSourceLogFiles.filePatterns -contains $DcrFilePattern) {
+                Write-Host "DCR Data Source already contains File Pattern $DcrFilePattern - no update needed" -ForegroundColor Green
+            }
+            else {
+                $newFilePatterns = $exisitingDataSourceLogFiles.filePatterns + @($DcrFilePattern)
+
+                $dcrDataSource = New-AzLogFilesDataSourceObject `
+                    -Name $exisitingDataSourceLogFiles.name  `
+                    -FilePattern $newFilePatterns `
+                    -Stream $exisitingDataSourceLogFiles.streams[0]    
+                    
+                # attach this to the exisiting DCR
+                $null = Update-AzDataCollectionRule `
+                    -Name $dcrResource.Name `
+                    -ResourceGroupName $dcrResource.ResourceGroupName `
+                    -SubscriptionId $dcrResource.SubscriptionId `
+                    -DataSourceLogFile  $dcrDataSource 
+
+            }
         }
+        else {
+            $dcrDataSource = New-AzLogFilesDataSourceObject `
+                -Name $dataSourceName  `
+                -FilePattern $DcrFilePattern `
+                -Stream $incomingStream
+
+            # attach this to the exisiting DCR
+            $null = Update-AzDataCollectionRule `
+                -Name $dcrResource.Name `
+                -ResourceGroupName $dcrResource.ResourceGroupName `
+                -SubscriptionId $dcrResource.SubscriptionId `
+                -DataSourceLogFile  $dcrDataSource 
+        }
+            
+        $retDcrResource = $dcrResource
     }
 
-    return $targetDcr
+    # create the DCR Association
+    $null = New-AzDataCollectionRuleAssociation `
+        -AssociationName $retDcrResource.properties.dataSources.logFiles[0].name `
+        -ResourceUri $vmResourceId `
+        -DataCollectionRuleId $retDcrResource.ResourceId
+    $associationCreated = $true
+
+    return [PSCustomObject]@{
+        DcrResource = $retDcrResource
+        DcrCreated = $dcrCreated
+        AssociationCreated = $associationCreated
+        AssociationName = $retDcrResource.properties.dataSources.logFiles[0].name
+    }
 }
 
         # Create a DCR based on a name
@@ -308,15 +395,15 @@ function New-DcrFromWildcard {
 
     $dceId = "/subscriptions/$dcrSubscriptionId/resourceGroups/$dcrResourceGroupName/providers/Microsoft.Insights/dataCollectionEndpoints/$dceName"
     
-    $kind = if ($isLinuxVm) { "Linux" } else { "Windows" }
-
-    # Resolve the actual workspace resource instead of assuming it shares the DCR resource group.
-    $workspaceResource = @(Get-AzResource -ResourceType "Microsoft.OperationalInsights/workspaces" -Name $workspaceName -ErrorAction Stop) | Select-Object -First 1
-    if ($null -eq $workspaceResource) {
-        throw "Workspace $workspaceName was not found in subscription $dcrSubscriptionId."
+    if ($isLinuxVm -eq $true) {
+        $kind = "Linux"
+    }
+    else {
+        $kind = "Windows"
     }
 
-    $workspaceResourceId = $workspaceResource.ResourceId
+    # Lookup Workspace Resource Id based on its Id
+    $workspaceResourceId = "/subscriptions/$dcrSubscriptionId/resourcegroups/$dcrResourceGroupName/providers/microsoft.operationalinsights/workspaces/$workspaceName"
 
     # Create DCR payload
     $dcrPayload = @{
@@ -368,10 +455,28 @@ function New-DcrFromWildcard {
     $payload = $dcrPayload | ConvertTo-Json -depth 10
     
     # Deploy DCR
-    $retDcr = New-AzDataCollectionRule `
-        -Name "$dcrName" `
-        -ResourceGroupName "$dcrResourceGroupName" `
-        -JsonString $payload
+    try {
+        $retDcr = New-AzDataCollectionRule `
+            -Name "$dcrName" `
+            -ResourceGroupName "$dcrResourceGroupName" `
+            -JsonString $payload `
+            -ErrorAction Stop
+    }
+    catch {
+        Write-Host "New-AzDataCollectionRule failed for $dcrName, retrying via ARM REST API" -ForegroundColor Yellow
+
+        $resourcePath = "/subscriptions/$dcrSubscriptionId/resourceGroups/$dcrResourceGroupName/providers/Microsoft.Insights/dataCollectionRules/$dcrName?api-version=2023-03-11"
+        $restResponse = Invoke-AzRestMethod `
+            -Method PUT `
+            -Path $resourcePath `
+            -Payload $payload `
+            -ErrorAction Stop
+
+        $restResource = $restResponse.Content | ConvertFrom-Json
+        $retDcr = [PSCustomObject]@{
+            Id = $restResource.id
+        }
+    }
 
     return $retDcr
 }
@@ -385,18 +490,32 @@ function Get-AnchorFromWildcard {
         [bool]$IsLinuxVm
     )
 
-    $segments = Get-SplunkPathSegments -Path $SplunkWildcardPathname -IsLinuxVm $IsLinuxVm
-    $separator = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
+    # Build an "anchor": everything before the first segment that contains a wildcard (* ? [)
+    if ($IsLinuxVm -eq $true) {
+        # Convert Windows path to use '/' for easier processing
+        $segments = $SplunkWildcardPathname -split '/'
+    }
+    else {
+        # Ensure Windows path uses '\' (it should already)
+       $segments = $SplunkWildcardPathname -split '\\'
+    }
     
     $anchorSegments = @()
+    $sawWildcard = $false
     foreach ($seg in $segments) {
-        if (Test-SplunkSegmentHasWildcard -Segment $seg) { break }
+        if ($seg -match '[\*\?\[\.]') { $sawWildcard = $true; break }
         if ($seg -ne '') { $anchorSegments += $seg }
     }
 
-    $anchor = $anchorSegments -join $separator
-    if ($IsLinuxVm -and $SplunkWildcardPathname.StartsWith($separator)) {
-        $anchor = "$separator$anchor"
+    if ($IsLinuxVm) {
+        # If the pattern starts with '/', keep it in the anchor for correct matching
+        $leadingSlash = $SplunkWildcardPathname.StartsWith('/')
+
+        $anchor = ($anchorSegments -join '/')
+        if ($leadingSlash) { $anchor = "/$anchor" }
+    }
+    else {
+        $anchor = ($anchorSegments -join '\')
     }
 
     return $anchor
@@ -414,19 +533,26 @@ function Get-FirstDcrFilePattern {
     )
 
     foreach ($item in $splunkWildcardPaths) {
-        if (Test-SplunkPathMatch -Path $Folder -Pattern $item -IsLinuxVm $IsLinuxVm) {
-            return $Folder
-        }
+        # eg '/var/.../*.log' becomes '/var/.*/[^/]+.log'
+        $regexPattern = Convert-SplunkWildcardToRegex -Pattern $item -IsLinuxVm $IsLinuxVm
 
-        $sep = Get-SplunkPathSeparator -IsLinuxVm $IsLinuxVm
-        $splunkPatternFileName = $item.Substring($item.LastIndexOf($sep))
+        # eg '/*.log'
+        if ($IsLinuxVm -eq $true) {
+            $splunkPatternFileName = $item.Substring($item.LastIndexOf('/'))
+        }
+        else {
+            $splunkPatternFileName = $item.Substring($item.LastIndexOf('\'))
+        }
 
         # eg '/var/log' + '/*.log'
         $dcrFilePattern = $Folder + $splunkPatternFileName
         
         # eg '/var/log/*.log' matches '/var/[^/]+/[^/]+.log'
-                if (Test-SplunkPathMatch -Path $dcrFilePattern -Pattern $item -IsLinuxVm $IsLinuxVm) {
-            return $dcrFilePattern
+        if ($dcrFilePattern -match $regexPattern) {
+            return [PSCustomObject]@{
+                SplunkWildcardPath = $item
+                DcrFilePattern = $dcrFilePattern
+            }
         }
     }
     return $null
@@ -624,24 +750,38 @@ function Get-IngestScript {
         [int]$maxRetries
     )
 
-    $params = @{
-        isArcConnectedMachine = $isArcConnectedMachine
-        scriptStorageAccount  = $scriptStorageAccount
-        LogFilePath           = $LogFilePath
-        tableName             = $tableName
-        dcrImmutableId        = $dcrImmutableId
-        dceEndpointId         = $dceEndpointId
-        timestampColumn       = $timestampColumn
-        timespan              = $timespan
-        scriptContainerName   = $scriptContainerName
-        workspaceId           = $workspaceId
-        VMName                = $VMName
-        sleepTime             = $sleepTime
-        maxRetries            = $maxRetries
+    if ($isLinuxVm -eq $true) {
+        return Get-IngestScriptLinux `
+            -isArcConnectedMachine $isArcConnectedMachine `
+            -scriptStorageAccount $scriptStorageAccount `
+            -LogFilePath $LogFilePath `
+            -tableName $tableName `
+            -dcrImmutableId $dcrImmutableId `
+            -dceEndpointId $dceEndpointId `
+            -timestampColumn $timestampColumn `
+            -timespan $timespan `
+            -scriptContainerName $scriptContainerName `
+            -workspaceId $workspaceId `
+            -VMName $VMName `
+            -sleepTime $sleepTime `
+            -maxRetries $maxRetries
     }
-
-    if ($isLinuxVm) { return Get-IngestScriptLinux @params }
-    else { return Get-IngestScriptWindows @params }
+    else {
+        return Get-IngestScriptWindows `
+            -isArcConnectedMachine $isArcConnectedMachine `
+            -scriptStorageAccount $scriptStorageAccount `
+            -LogFilePath $LogFilePath `
+            -tableName $tableName `
+            -dcrImmutableId $dcrImmutableId `
+            -dceEndpointId $dceEndpointId `
+            -timestampColumn $timestampColumn `
+            -timespan $timespan `
+            -scriptContainerName $scriptContainerName `
+            -workspaceId $workspaceId `
+            -VMName $VMName `
+            -sleepTime $sleepTime `
+            -maxRetries $maxRetries
+    }
 }
 
 
@@ -656,58 +796,150 @@ function RunCommand {
         [bool]$IsAsync = $false
     )
 
-    $retryMax = 10
-    $retryDelay = 60  # seconds
+    # Create a key combining all three boolean states
+    $caseKey = "$IsArcConnectedMachine-$IsLinuxVm-$IsAsync"
 
-    for ($attempt = 1; $attempt -le $retryMax; $attempt++) {
-        try {
-            $commandId = if ($IsLinuxVm) { 'RunShellScript' } else { 'RunPowerShellScript' }
-
-            if ($IsArcConnectedMachine) {
-                $arcRes = Get-AzResource -ResourceGroupName $ResourceGroupName -ResourceName $VMName -ResourceType "Microsoft.HybridCompute/machines" -ErrorAction SilentlyContinue
-                if ($null -eq $arcRes) {
-                    throw "Arc machine '$VMName' not found in resource group '$ResourceGroupName'. Verify it is registered in Azure Arc."
-                }
-                $runCmdName = "runcmd-$(Get-Date -Format 'HHmmss')"
-                $asyncParams = @{}
-                if ($IsAsync) { $asyncParams['AsJob'] = $true }
-                $result = New-AzConnectedMachineRunCommand `
-                    -ResourceGroupName $ResourceGroupName `
-                    -MachineName $VMName `
-                    -RunCommandName $runCmdName `
-                    -Location $arcRes.Location `
-                    -SourceScript $ScriptString `
-                    @asyncParams
-            }
-            elseif ($IsAsync) {
-                $result = Invoke-AzVMRunCommand `
-                    -ResourceGroupName $ResourceGroupName `
-                    -VMName $VMName `
-                    -CommandId $commandId `
-                    -ScriptString $ScriptString `
-                    -AsJob
-            }
-            else {
-                $result = Invoke-AzVMRunCommand `
-                    -ResourceGroupName $ResourceGroupName `
-                    -VMName $VMName `
-                    -CommandId $commandId `
-                    -ScriptString $ScriptString `
-                    -ErrorAction Stop
-            }
-
-            return $result
+    switch ($caseKey) {
+        # Arc + Linux + Async
+        "True-True-True" {
+            $result = New-AzConnectedMachineRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -MachineName $VMName `
+                -Location $dcrLocation `
+                -RunCommandName "ArcRunCmd-$(Get-Date -Format 'yyyyMMddHHmmss')" `
+                -SourceScript $ScriptString `
+                -AsJob
         }
-        catch {
-            if ($_.Exception.Message -match '409|Conflict|in progress' -and $attempt -lt $retryMax) {
-                Write-Host "Run command conflict on $VMName (attempt $attempt/$retryMax). Retrying in ${retryDelay}s..." -ForegroundColor Yellow
-                Start-Sleep -Seconds $retryDelay
-            }
-            else {
-                throw
-            }
+        # Arc + Linux + Sync
+        "True-True-False" {
+                $result = New-AzConnectedMachineRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -MachineName $VMName `
+                    -Location $dcrLocation `
+                    -RunCommandName "ArcRunCmd-$(Get-Date -Format 'yyyyMMddHHmmss')" `
+                    -SourceScript $ScriptString
+        }
+        # Arc + Windows + Async
+        "True-False-True" {
+            $result = New-AzConnectedMachineRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -MachineName $VMName `
+                -Location $dcrLocation `
+                -RunCommandName "ArcRunCmd-$(Get-Date -Format 'yyyyMMddHHmmss')" `
+                -SourceScript $ScriptString `
+                -AsJob
+        }
+        # Arc + Windows + Sync
+        "True-False-False" {
+                $result = New-AzConnectedMachineRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -MachineName $VMName `
+                    -Location $dcrLocation `
+                    -RunCommandName "ArcRunCmd-$(Get-Date -Format 'yyyyMMddHHmmss')" `
+                    -SourceScript $ScriptString
+        }
+        # Azure VM + Linux + Async
+        "False-True-True" {
+            $result = Invoke-AzVMRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -VMName $VMName `
+                -CommandId 'RunShellScript' `
+                -ScriptString $ScriptString `
+                -AsJob
+        }
+        # Azure VM + Linux + Sync
+        "False-True-False" {
+            $result = Invoke-AzVMRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -VMName $VMName `
+                -CommandId 'RunShellScript' `
+                -ScriptString $ScriptString
+        }
+        # Azure VM + Windows + Async
+        "False-False-True" {
+            $result = Invoke-AzVMRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -VMName $VMName `
+                -CommandId 'RunPowerShellScript' `
+                -ScriptString $ScriptString `
+                -AsJob
+        }
+        # Azure VM + Windows + Sync
+        "False-False-False" {
+            $result = Invoke-AzVMRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -VMName $VMName `
+                -CommandId 'RunPowerShellScript' `
+                -ScriptString $ScriptString
         }
     }
+
+    return $result
+}
+
+function Invoke-DiscoveryRunCommandWithProgress {
+    param (
+        [string]$ResourceGroupName,
+        [string]$VMName,
+        [string]$ScriptString,
+        [bool]$IsArcConnectedMachine,
+        [bool]$IsLinuxVm,
+        [System.Diagnostics.Stopwatch]$Stopwatch,
+        [string]$RunCommandName = ""
+    )
+
+    if (-not $IsArcConnectedMachine) {
+        return RunCommand `
+            -ResourceGroupName $ResourceGroupName `
+            -VMName $VMName `
+            -ScriptString $ScriptString `
+            -IsArcConnectedMachine $IsArcConnectedMachine `
+            -IsLinuxVm $IsLinuxVm
+    }
+
+    $runCmdName = if ([string]::IsNullOrWhiteSpace($RunCommandName)) { "discover-$(Get-Date -Format 'yyyyMMddHHmmss')" } else { $RunCommandName }
+    $job = New-AzConnectedMachineRunCommand `
+        -ResourceGroupName $ResourceGroupName `
+        -MachineName $VMName `
+        -Location $dcrLocation `
+        -RunCommandName $runCmdName `
+        -SourceScript $ScriptString `
+        -AsJob
+
+    while ($job.State -eq 'Running' -or $job.State -eq 'NotStarted') {
+        $statusParts = @("JobState=$($job.State)")
+        try {
+            $rcStatus = Get-AzConnectedMachineRunCommand `
+                -ResourceGroupName $ResourceGroupName `
+                -MachineName $VMName `
+                -RunCommandName $runCmdName `
+                -ErrorAction SilentlyContinue
+            if ($rcStatus) {
+                $statusParts += "ProvisioningState=$($rcStatus.ProvisioningState)"
+            }
+        }
+        catch {
+        }
+
+        Write-PhaseLog -VMName $VMName -Phase ("discovery waiting: " + ($statusParts -join ', ')) -Stopwatch $Stopwatch -Color DarkGray
+        Start-Sleep -Seconds 15
+        $job = Get-Job -Id $job.Id
+    }
+
+    if ($job.State -ne 'Completed') {
+        $jobErrors = Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue 2>&1
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        throw "Arc discovery job failed for ${VMName} with state $($job.State). $($jobErrors | Out-String)"
+    }
+
+    $null = Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    $result = Get-AzConnectedMachineRunCommand `
+        -ResourceGroupName $ResourceGroupName `
+        -MachineName $VMName `
+        -RunCommandName $runCmdName `
+        -ErrorAction Stop
+    return $result
 }
 
 # start an async run-command to monitor the target table and ingest any missing log file entries
@@ -797,244 +1029,90 @@ function main {
         [System.Boolean]$IsLinuxVm
     )
 
-    # Pre-load all existing group DCRs into a cache (name -> resource with properties)
-    $groupDcrCache = @{}
-    $allDcrs = @(Get-AzResource -ResourceGroupName $dcrResourceGroup -ResourceType "microsoft.insights/datacollectionrules" -ErrorAction SilentlyContinue)
-    foreach ($d in $allDcrs) {
-        $detail = Get-AzResource -ResourceId $d.ResourceId
-        $groupDcrCache[$d.Name] = $detail
-    }
-    if ($IsDebugLoggingEnabled) {
-        Write-Host "[DEBUG] Loaded $($groupDcrCache.Count) existing DCR(s) from $dcrResourceGroup" -ForegroundColor DarkYellow
-    }
 
-    $vmTypeLabel = "$(if ($IsArcConnectedMachine) { 'Arc' } else { 'Azure' }) $(if ($IsLinuxVm) { 'Linux' } else { 'Windows' })"
-
-    # Build the discovery command once (same for all VMs sharing these patterns)
-    $cmds = ""
-    foreach ($wildcardPath in $SplunkWildcardPaths) {
-        $anchor = Get-AnchorFromWildcard -SplunkWildcardPathname $wildcardPath -IsLinuxVm $IsLinuxVm
-        $patternHasWildcard = Test-SplunkPatternHasWildcard -Pattern $wildcardPath -IsLinuxVm $IsLinuxVm
-
-        if ($patternHasWildcard) {
-            if ($IsLinuxVm) {
-                $cmd = "find `"$anchor`" \( -type f -o -type d \) -printf '%y:%p`n'"
-            }
-            else {
-                $cmd = "Get-ChildItem -Path '$anchor' -Recurse -Force | ForEach-Object { if (`$_.PSIsContainer) { 'd:' + `$_.FullName } else { 'f:' + `$_.FullName } }"
-            }
-        }
-        else {
-            if ($IsLinuxVm) {
-                $cmd = "if [ -e `"$wildcardPath`" ]; then if [ -d `"$wildcardPath`" ]; then printf 'd:%s`n' `"$wildcardPath`"; else printf 'f:%s`n' `"$wildcardPath`"; fi; fi"
-            }
-            else {
-                $cmd = "if (Test-Path -LiteralPath '$wildcardPath') { `$item = Get-Item -LiteralPath '$wildcardPath' -Force; if (`$item.PSIsContainer) { 'd:' + `$item.FullName } else { 'f:' + `$item.FullName } }"
-            }
-        }
-
-        $cmds += $cmd + "; "
-    }
-
-    # ── Phase 1: Submit parallel discovery jobs ──
-    Write-Host "`n=== Phase 1: Submitting discovery jobs for $($VmList.Count) ${vmTypeLabel} VM(s) ===" -ForegroundColor Cyan
-    $discoveryEntries = @()  # array of @{ Job = <job|null>; Vm = <vm array> }
-
-    if ($IsTestingMode) {
-        foreach ($vm in $VmList) {
-            $discoveryEntries += @{ Job = $null; Vm = $vm }
-        }
-    }
-    else {
-        # Group VMs by subscription to minimize Set-AzContext calls
-        $vmsBySubscription = [ordered]@{}
-        foreach ($vm in $VmList) {
-            $subId = $vm[0]
-            if (-not $vmsBySubscription.Contains($subId)) {
-                $vmsBySubscription[$subId] = @()
-            }
-            $vmsBySubscription[$subId] += ,@($vm)
-        }
-
-        $commandId = if ($IsLinuxVm) { 'RunShellScript' } else { 'RunPowerShellScript' }
-
-        foreach ($subId in $vmsBySubscription.Keys) {
-            # Set context once per subscription before submitting its jobs
-            if ($script:lastContextSubscriptionId -ne $subId) {
-                $tenantId = (Get-AzSubscription -SubscriptionId $subId -WarningAction SilentlyContinue).TenantId
-                Set-AzContext -Subscription $subId -TenantId $tenantId -WarningAction SilentlyContinue | Out-Null
-                $script:lastContextSubscriptionId = $subId
-            }
-
-            foreach ($vm in $vmsBySubscription[$subId]) {
-                $machine = $vm[2]
-                $resourceGroup = $vm[1]
-
-                # Throttle: wait if we have hit the max parallel limit
-                while (@($discoveryEntries | Where-Object { $null -ne $_.Job -and $_.Job.State -eq 'Running' }).Count -ge $maxParallelJobs) {
-                    Start-Sleep -Seconds 5
-                }
-
-                try {
-                    Write-Host "  Submitting discovery job for $machine" -ForegroundColor Green
-                    if ($IsArcConnectedMachine) {
-                        # Resolve the Arc machine resource to get its actual location
-                        $arcResource = Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.HybridCompute/machines" -ErrorAction SilentlyContinue
-                        if ($null -eq $arcResource) {
-                            Write-Host "  ERROR: Arc machine '$machine' not found in resource group '$resourceGroup' (subscription $subId). Verify it is registered in Azure Arc and the CSV has the correct name/RG." -ForegroundColor Red
-                            $discoveryEntries += @{ Job = $null; Vm = $vm }
-                            continue
-                        }
-                        $arcLocation = $arcResource.Location
-                        $runCmdName = "discover-$(Get-Date -Format 'HHmmss')"
-                        $job = New-AzConnectedMachineRunCommand `
-                            -ResourceGroupName $resourceGroup `
-                            -MachineName $machine `
-                            -RunCommandName $runCmdName `
-                            -Location $arcLocation `
-                            -SourceScript $cmds `
-                            -AsJob
-                    }
-                    else {
-                        $runCmdName = $null
-                        $job = Invoke-AzVMRunCommand `
-                            -ResourceGroupName $resourceGroup `
-                            -VMName $machine `
-                            -CommandId $commandId `
-                            -ScriptString $cmds `
-                            -AsJob
-                    }
-                    $discoveryEntries += @{ Job = $job; Vm = $vm; IsArc = $IsArcConnectedMachine; RunCmdName = $runCmdName; ResourceGroup = $resourceGroup }
-                }
-                catch {
-                    Write-Host "  Error submitting discovery for ${machine}: $_" -ForegroundColor Red
-                    $discoveryEntries += @{ Job = $null; Vm = $vm }
-                }
-            }
-        }
-
-        # Wait for all discovery jobs to complete
-        $jobEntries = @($discoveryEntries | Where-Object { $null -ne $_.Job })
-        if ($jobEntries.Count -gt 0) {
-            Write-Host "`nWaiting for $($jobEntries.Count) discovery job(s) to complete..." -ForegroundColor Cyan
-            $totalJobs = $jobEntries.Count
-            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-            $lastDoneCount = -1
-            $reportedCompleted = @{}
-            while ($true) {
-                $stillRunningEntries = @($jobEntries | Where-Object { $_.Job.State -eq 'Running' })
-                if ($stillRunningEntries.Count -eq 0) { break }
-                $doneCount = $totalJobs - $stillRunningEntries.Count
-                $elapsed = $stopwatch.Elapsed.ToString('mm\:ss')
-                # Report newly completed/failed jobs once
-                foreach ($entry in $jobEntries) {
-                    $vmName = $entry.Vm[2]
-                    if ($entry.Job.State -ne 'Running' -and -not $reportedCompleted.ContainsKey($vmName)) {
-                        $state = $entry.Job.State
-                        $color = if ($state -eq 'Completed') { 'Green' } else { 'Red' }
-                        Write-Host "    $vmName -> $state" -ForegroundColor $color
-                        if ($state -eq 'Failed') {
-                            $childJob0 = if ($entry.Job.ChildJobs -and $entry.Job.ChildJobs.Count -gt 0) { $entry.Job.ChildJobs[0] } else { $null }
-                            if ($childJob0) {
-                                $childErr = $childJob0.Error | Select-Object -First 2
-                                foreach ($e in $childErr) { Write-Host "      Error: $e" -ForegroundColor Red }
-                            }
-                        }
-                        $reportedCompleted[$vmName] = $true
-                    }
-                }
-                # Show per-VM debug details for still-running jobs
-                foreach ($entry in $stillRunningEntries) {
-                    $vmName = $entry.Vm[2]
-                    $childJob = if ($entry.Job.ChildJobs -and $entry.Job.ChildJobs.Count -gt 0) { $entry.Job.ChildJobs[0] } else { $null }
-                    $childState = if ($childJob) { $childJob.State } else { 'N/A' }
-                    $typeLabel = if ($entry.IsArc) { 'Arc' } else { 'Azure' }
-                    $detail = "  [$elapsed] $vmName ($typeLabel): JobState=$($entry.Job.State), ChildState=$childState"
-                    # Check for any progress records from the child job
-                    if ($childJob -and $childJob.Progress.Count -gt 0) {
-                        $lastProgress = $childJob.Progress[$childJob.Progress.Count - 1]
-                        $detail += ", Activity=$($lastProgress.Activity), Status=$($lastProgress.StatusDescription)"
-                        if ($lastProgress.PercentComplete -ge 0) { $detail += " ($($lastProgress.PercentComplete)%)" }
-                    }
-                    # Check for any warnings
-                    if ($childJob -and $childJob.Warning.Count -gt 0) {
-                        $lastWarn = $childJob.Warning[$childJob.Warning.Count - 1]
-                        $detail += ", Warning=$lastWarn"
-                    }
-                    # For Arc VMs, query the run command provisioning state
-                    if ($entry.IsArc -and $entry.RunCmdName) {
-                        try {
-                            $rcStatus = Get-AzConnectedMachineRunCommand -ResourceGroupName $entry.ResourceGroup -MachineName $vmName -RunCommandName $entry.RunCmdName -ErrorAction SilentlyContinue
-                            if ($rcStatus) {
-                                $detail += ", ProvisioningState=$($rcStatus.ProvisioningState)"
-                                if ($rcStatus.InstanceViewExecutionState) { $detail += ", ExecState=$($rcStatus.InstanceViewExecutionState)" }
-                            }
-                        } catch { }
-                    }
-                    Write-Host $detail -ForegroundColor DarkCyan
-                }
-                Start-Sleep -Seconds 15
-            }
-            $stopwatch.Stop()
-            $totalElapsed = $stopwatch.Elapsed.ToString('mm\:ss')
-            $completedCount = @($jobEntries | Where-Object { $_.Job.State -eq 'Completed' }).Count
-            $failedCount = $jobEntries.Count - $completedCount
-            # Show final status per VM
-            foreach ($entry in $jobEntries) {
-                $vmName = $entry.Vm[2]
-                $state = $entry.Job.State
-                $color = if ($state -eq 'Completed') { 'Green' } else { 'Red' }
-                Write-Host "    $vmName -> $state" -ForegroundColor $color
-            }
-            Write-Host "Discovery complete in $totalElapsed : $completedCount succeeded, $failedCount failed." -ForegroundColor Green
-        }
-    }
-
-    # ── Phase 2: Process results sequentially (match folders, create/update DCRs, associate, ingest) ──
-    Write-Host "`n=== Phase 2: Processing results and managing DCRs ===" -ForegroundColor Cyan
-
-    foreach ($entry in $discoveryEntries) {
-        $vm = $entry.Vm
-        $job = $entry.Job
-        $serverStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    foreach ($vm in $VmList) {
         $subscriptionId = $vm[0]
         $resourceGroup = $vm[1]
         $machine = $vm[2]
         $dceName = $vm[3]
         $workspaceName = $vm[4]
         $tableName = $vm[5]
+        $serverStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-        if ($script:lastContextSubscriptionId -ne $subscriptionId) {
-            $tenantId = (Get-AzSubscription -SubscriptionId $subscriptionId -WarningAction SilentlyContinue).TenantId
-            Set-AzContext -Subscription $subscriptionId -TenantId $tenantId -WarningAction SilentlyContinue | Out-Null
-            $script:lastContextSubscriptionId = $subscriptionId
-        }
+        try {
+            Set-AzContextForSubscription -SubscriptionId $subscriptionId
 
-        Write-Host "`nProcessing ${vmTypeLabel} VM: $machine in Resource Group: $resourceGroup" -ForegroundColor Green
+            $vmTypeLabel = "$(if ($IsArcConnectedMachine) { 'Arc' } else { 'Azure' }) $(if ($IsLinuxVm) { 'Linux' } else { 'Windows' })"
 
-        # Retrieve discovery results
-        if ($IsTestingMode) {
-            $resultArr = ,@('d:C:\Logs')
-        }
-        else {
-            if ($null -eq $job) {
-                Write-Host "No discovery job for $machine. Skipping." -ForegroundColor Yellow
-                continue
+            Write-Host "Processing $vmTypeLabel VM: $machine in Resource Group: $resourceGroup under Subscription: $subscriptionId" -ForegroundColor Green
+
+            $cmdTemplateLinux = 'find $anchor -wholename "$path" $pipeline'
+            $cmdTemplateWindows = 'Get-ChildItem -Path $anchor -Recurse -Force | Where-Object { $_.FullName -like "$path" } | Select-Object -ExpandProperty FullName'
+
+            if ($IsLinuxVm -eq $false) {
+                $cmdTemplate = $cmdTemplateWindows
+            }
+            else {
+                $cmdTemplate = $cmdTemplateLinux
             }
 
+            # make big command as run-command is expensive, so do once per server
+            $cmds = ""
+            foreach ($wildcardPath in $SplunkWildcardPaths) {
+                $anchor = Get-AnchorFromWildcard -SplunkWildcardPathname $wildcardPath -IsLinuxVm $IsLinuxVm
+                $regexPattern = if ($IsLinuxVm) { Convert-SplunkWildcardToRegex -Pattern $wildcardPath -IsLinuxVm $IsLinuxVm } else { $null }
+                # if path contains a wildcard then use dirname to return the folder name only
+                # else we already have the folder name eg /etc
+                if ($wildcardPath -match '[\*\?\[\.]') {
+                    $pipeline = "| xargs -I {} dirname {} | sort -u"
+                }
+                else {
+                    $pipeline = "| sort -u"
+                }
+                if ($IsLinuxVm -and $wildcardPath -match '\.\.\.') {
+                    $cmd = "find $anchor -regextype posix-extended -regex `"$regexPattern`" $pipeline"
+                }
+                else {
+                    $cmd = $cmdTemplate `
+                        -replace '\$anchor', $anchor `
+                        -replace '\$path', $wildcardPath `
+                        -replace '\$pipeline', $pipeline
+                }
+                $cmds += $cmd + "; "
+            }
+
+            # create a runCommand function and pass in OS and IsOnPrem parameters
+            # TODO error handling if the VM is not reachable
             $result = $null
-            try {
-                $result = Receive-Job -Job $job -ErrorAction Stop
+            $discoveryRunCommandName = if ($IsArcConnectedMachine) { "discover-$(Get-Date -Format 'yyyyMMddHHmmss')" } else { $null }
+            $discoverySubmittedPhase = if ($IsArcConnectedMachine) { "discovery submitted: $discoveryRunCommandName" } else { 'discovery submitted' }
+            Write-PhaseLog -VMName $machine -Phase $discoverySubmittedPhase -Stopwatch $serverStopwatch -Color DarkCyan
+
+            if ($IsTestingMode) {
+                # Azure Linux test case
+                #$resultArr = ,@('/var/log')
+                # Arc Linux Test Case
+                #$resultArr = ,@('/var/log/azure/run-command-handler')
+                # Arc Windows Text case
+                $resultArr = ,@('C:\Logs')
+                $sleepTime = 10
+                $maxRetries = 3
             }
-            catch {
-                Write-Host "Error receiving discovery result for ${machine}: $_" -ForegroundColor Red
-                continue
-            }
-            finally {
-                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            else {
+                $result = Invoke-DiscoveryRunCommandWithProgress `
+                    -ResourceGroupName $resourceGroup `
+                    -VMName $machine `
+                    -ScriptString $cmds `
+                    -IsArcConnectedMachine $IsArcConnectedMachine `
+                    -IsLinuxVm $IsLinuxVm `
+                    -Stopwatch $serverStopwatch `
+                    -RunCommandName $discoveryRunCommandName
             }
 
-            # New-AzConnectedMachineRunCommand returns InstanceViewOutput; Invoke-AzVMRunCommand returns Value[0].Message
+
+        # convert the multiline string returned to an array
+        # New-AzConnectedMachineRunCommand returns InstanceViewOutput; Invoke-AzVMRunCommand returns Value[0].Message
+        if ($IsTestingMode -eq $false) {
             if ($result.PSObject.Properties.Match('InstanceViewOutput').Count -gt 0 -and $null -ne $result.InstanceViewOutput) {
                 $resultArr = $result.InstanceViewOutput -split "`n"
             }
@@ -1042,111 +1120,32 @@ function main {
                 $resultArr = $result.Value[0].Message -split "`n"
             }
             else {
-                Write-Host "No output returned from discovery on VM ${machine}. Skipping." -ForegroundColor Yellow
+                Write-Host "No output returned from Run Command on VM ${machine} - skipping" -ForegroundColor Yellow
                 continue
             }
         }
 
-        # Match discovered paths against Splunk wildcard patterns
-        $matchedFolders = @()
-        $debugMatchDetails = @{}
-        foreach ($candidateLineRaw in ($resultArr | Select-Object -Unique)) {
-            $candidateLine = $candidateLineRaw.Trim()
+            Write-PhaseLog -VMName $machine -Phase 'discovery completed' -Stopwatch $serverStopwatch -Color Green
 
-            if ([string]::IsNullOrWhiteSpace($candidateLine) -or $candidateLine.Length -lt 3 -or $candidateLine[1] -ne ':') {
-                continue
-            }
-
-            $candidateType = $candidateLine.Substring(0, 1).ToLowerInvariant()
-            $candidatePath = $candidateLine.Substring(2)
-
-            if ($IsLinuxVm -eq $false) {
-                if ($candidatePath -notmatch '^[a-zA-Z]:\\') { continue }
-            }
-            else {
-                if ($candidatePath -notlike '/*') { continue }
-            }
-
-            foreach ($wildcardPath in $SplunkWildcardPaths) {
-                if (-not (Test-SplunkPathMatch -Path $candidatePath -Pattern $wildcardPath -IsLinuxVm $IsLinuxVm)) {
-                    continue
-                }
-
-                $resolvedFolder = $null
-                if ($candidateType -eq 'd') {
-                    $matchedFolders += $candidatePath
-                    $resolvedFolder = $candidatePath
-                }
-                elseif ($candidateType -eq 'f') {
-                    $parentFolder = Get-ParentFolderPath -Path $candidatePath -IsLinuxVm $IsLinuxVm
-                    if ($null -ne $parentFolder) {
-                        $matchedFolders += $parentFolder
-                        $resolvedFolder = $parentFolder
-                    }
-                }
-
-                if ($IsDebugLoggingEnabled -and $null -ne $resolvedFolder) {
-                    if (-not $debugMatchDetails.ContainsKey($resolvedFolder)) {
-                        $debugMatchDetails[$resolvedFolder] = @()
-                    }
-                    if ($debugMatchDetails[$resolvedFolder] -notcontains $wildcardPath) {
-                        $debugMatchDetails[$resolvedFolder] += $wildcardPath
-                    }
-                }
-            }
-        }
-
-        $resultArrUnique = @($matchedFolders | Select-Object -Unique)
-
-        if ($IsDebugLoggingEnabled) {
-            Write-Host "`n[DEBUG] Folder match summary for server: $machine" -ForegroundColor DarkYellow
-            if ($resultArrUnique.Count -eq 0) {
-                Write-Host "  (no matching folders found)" -ForegroundColor DarkGray
-            }
-            else {
-                foreach ($debugFolder in $resultArrUnique) {
-                    Write-Host "  Folder: $debugFolder" -ForegroundColor DarkCyan
-                    if ($debugMatchDetails.ContainsKey($debugFolder)) {
-                        foreach ($debugPattern in $debugMatchDetails[$debugFolder]) {
-                            Write-Host "    Matched pattern: $debugPattern" -ForegroundColor DarkGray
-                        }
-                    }
-                }
-            }
-            Write-Host ""
-        }
-
-        # Resolve per-VM resources once before iterating folders
-        if ($IsArcConnectedMachine -eq $true) {
-            $vmResource = Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.HybridCompute/machines" -ErrorAction SilentlyContinue
-            if ($null -eq $vmResource) {
-                Write-Host "ERROR: Arc machine '$machine' not found in resource group '$resourceGroup' (subscription $subscriptionId). Verify it is registered in Azure Arc and the CSV has the correct name/RG. Skipping." -ForegroundColor Red
-                continue
-            }
-            $vmResourceId = $vmResource.ResourceId
-        } else {
-            $vmResource = Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.Compute/virtualMachines" -ErrorAction SilentlyContinue
-            if ($null -eq $vmResource) {
-                Write-Host "ERROR: Azure VM '$machine' not found in resource group '$resourceGroup' (subscription $subscriptionId). Skipping." -ForegroundColor Red
-                continue
-            }
-            $vmResourceId = $vmResource.ResourceId
-        }
-        $workspaceResource = @(Get-AzResource -ResourceType "Microsoft.OperationalInsights/workspaces" -Name $workspaceName -ErrorAction Stop) | Select-Object -First 1
-        $workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName $workspaceResource.ResourceGroupName -Name $workspaceName
-        $workspaceId = $workspace.CustomerId
+        # keep the unique entries in the array
+        $resultArrUnique = $resultArr | Select-Object -Unique
 
         foreach ($folder in $resultArrUnique) {
 
             if ($IsLinuxVm -eq $false) {
+                # filter out any non-windows folder paths
                 if ($folder -notmatch "^[a-zA-Z]:\\") { continue }
             }
             else {
+                # filter out any non-linux folder paths
                 if ($folder -notlike "/*") { continue }
             }
 
-            $dcrFilePattern = Get-FirstDcrFilePattern -Folder $folder -splunkWildcardPaths $splunkWildcardPaths -IsLinuxVm $IsLinuxVm
+            # lookup the first wildcard pattern and type associated with this folder
+            $patternMatch = Get-FirstDcrFilePattern -Folder $folder -splunkWildcardPaths $splunkWildcardPaths -IsLinuxVm $IsLinuxVm
+            $dcrFilePattern = if ($null -ne $patternMatch) { $patternMatch.DcrFilePattern } else { $null }
 
+            # if no matches log the error and continue
             if ($null -eq $dcrFilePattern) {
                 Write-Host "No matching wildcard pattern found for folder $folder on VM $machine - skipping" -ForegroundColor Yellow
                 continue
@@ -1154,25 +1153,61 @@ function main {
 
             Write-Host "Wildcard paths found on ${machine}:" -ForegroundColor Yellow
             Write-Host $folder -ForegroundColor Cyan
+            Write-Host "Matched pattern: $($patternMatch.SplunkWildcardPath) -> $dcrFilePattern" -ForegroundColor DarkCyan
 
-            $dcr = Ensure-GroupDcrPatternAndAssociation `
-                -FilePattern $dcrFilePattern `
-                -VmResourceId $vmResourceId `
-                -IsLinuxVm $IsLinuxVm `
-                -SubscriptionId $subscriptionId `
-                -DcrResourceGroup $dcrResourceGroup `
-                -DcrLocation $dcrLocation `
-                -DceName $dceName `
-                -WorkspaceName $workspaceName `
-                -TableName $tableName `
-                -DcrCache $groupDcrCache
+            # Get the VM Resource Id
+            if ($IsArcConnectedMachine -eq $true) {
+                $vmResourceId = (Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.HybridCompute/machines").ResourceId
+            }
+            else {  
+                $vmResourceId = (Get-AzResource -ResourceGroupName $resourceGroup -ResourceName $machine -ResourceType "Microsoft.Compute/virtualMachines").ResourceId
+            }
 
-            if ($dcr) {
-                $dce = Get-AzResource -ResourceId $dcr.Properties.dataCollectionEndpointId
+            $dcrFolderPath = Get-DcrFolderPath -VmResourceId $vmResourceId -Folder $folder -IsLinuxVm $IsLinuxVm
 
-                Write-Host "Starting async command to monitor and ingest logs for VM $machine, DCR $($dcr.Name), Log File Path $dcrFilePattern" -ForegroundColor Blue
+            if ($null -eq $dcrFolderPath) {
+                # lookup the Dcr Id based on the Resource Group and Name
+                $dcrName  = $(Get-DcrNameFromWildcard $dcrFilePattern)
 
-                RunCommandAsyncToIngestMissingLogs `
+                $dcrResult = New-DcrDataSourceAndAssociation `
+                    -DcrName $dcrName `
+                    -DcrFilePattern $dcrFilePattern `
+                    -vmResourceId $vmResourceId `
+                    -IsLinuxVm $IsLinuxVm `
+                    -subscriptionId $subscriptionId `
+                    -dcrResourceGroup $dcrResourceGroup `
+                    -dcrLocation $dcrLocation `
+                    -dceName $dceName `
+                    -workspaceName $workspaceName `
+                    -tableName $tableName
+
+                if ($dcrResult -and $dcrResult.DcrResource) {
+                    $dcr = $dcrResult.DcrResource
+                    if ($dcrResult.DcrCreated) {
+                        Write-PhaseLog -VMName $machine -Phase "DCR created: $dcrName" -Stopwatch $serverStopwatch -Color Green
+                    }
+                    else {
+                        Write-PhaseLog -VMName $machine -Phase "DCR reused: $dcrName" -Stopwatch $serverStopwatch -Color DarkGreen
+                    }
+                    if ($dcrResult.AssociationCreated) {
+                        Write-PhaseLog -VMName $machine -Phase "association created: $($dcrResult.AssociationName)" -Stopwatch $serverStopwatch -Color Green
+                    }
+
+                    # lookup the workspace immutable id based on the name and resourcegroup
+                    $workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName $dcrResourceGroup -Name $workspaceName
+                    $workspaceId = $workspace.CustomerId
+
+                    # lookup the DCE endpoint
+                    $dce = Get-AzResource -ResourceId $dcr.Properties.dataCollectionEndpointId
+
+                    # output the command we are about to run into the log
+                    Write-Host "Starting async command to monitor and ingest logs for VM $machine, DCR $dcrName, Log File Path $dcrFilePattern" -ForegroundColor Blue
+
+                    # at this point we have the DCR, Data Source, Folder Path and Association created
+                    # the detection of the new log file and the creation of the DCR plus time to first ingestion
+                    # will take some time
+                    # start an async run-command to monitor the target table and ingest any missing log file entries
+                    RunCommandAsyncToIngestMissingLogs `
                     -SubscriptionId $subscriptionId `
                     -ResourceGroupName $resourceGroup `
                     -VMName $machine `
@@ -1190,38 +1225,35 @@ function main {
                     -isLinuxVm $IsLinuxVm `
                     -sleepTime $sleepTime `
                     -maxRetries $maxRetries
+
+                    Write-PhaseLog -VMName $machine -Phase "helper started: $dcrFilePattern" -Stopwatch $serverStopwatch -Color Blue
+                }
             }
         }
-
-        if ($IsDebugLoggingEnabled) {
+        }
+        catch {
+            Write-Host "Error processing VM ${machine}: $_" -ForegroundColor Red
+            continue
+        }
+        finally {
             $serverStopwatch.Stop()
-            Write-Host "[DEBUG] Server $machine processed in $($serverStopwatch.Elapsed.ToString('mm\:ss\.ff'))" -ForegroundColor DarkYellow
+            Write-Host "[$(Format-ElapsedTime -Stopwatch $serverStopwatch)] [$machine] Total controller time spent on server" -ForegroundColor Magenta
         }
     }
 }
-
-# track last subscription to skip redundant Set-AzContext calls
-$script:lastContextSubscriptionId = $null
 
 # read the configuration file
 $connectedMachinesAndVmsHash = Get-VMListsFromCSV -CsvPath $config.csvPath
 
 # entry point for Azure Linux VMs
-if ($connectedMachinesAndVmsHash["AzureLinuxVMs"].Count -gt 0) {
-    main -SplunkWildcardPaths $linuxAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureLinuxVMs"] -IsArcConnectedMachine $false -IsLinuxVm $true
-}
+#main -SplunkWildcardPaths $linuxAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureLinuxVMs"] -IsArcConnectedMachine $false -IsLinuxVm $true
 
 # Entry point for Arc Linux VMs
-if ($connectedMachinesAndVmsHash["ArcLinuxVMs"].Count -gt 0) {
-    main -SplunkWildcardPaths $linuxArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcLinuxVMs"]  -IsArcConnectedMachine $true -IsLinuxVm $true
-}
+main -SplunkWildcardPaths $linuxArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcLinuxVMs"]  -IsArcConnectedMachine $true -IsLinuxVm $true
 
 # Entry point for Arc Windows VMs
-if ($connectedMachinesAndVmsHash["ArcWindowsVMs"].Count -gt 0) {
-    main -SplunkWildcardPaths $windowsArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcWindowsVMs"] -IsArcConnectedMachine $true -IsLinuxVm $false
-}
+#main -SplunkWildcardPaths $windowsArcSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["ArcWindowsVMs"] -IsArcConnectedMachine $true -IsLinuxVm $false
 
 # Entry point for Azure Windows VMs
-if ($connectedMachinesAndVmsHash["AzureWindowsVMs"].Count -gt 0) {
-    main -SplunkWildcardPaths $windowsAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureWindowsVMs"] -IsArcConnectedMachine $false -IsLinuxVm $false
-}
+#main -SplunkWildcardPaths $windowsAzureSplunkWildcardPatterns -VmList $connectedMachinesAndVmsHash["AzureWindowsVMs"] -IsArcConnectedMachine $false -IsLinuxVm $false
+
