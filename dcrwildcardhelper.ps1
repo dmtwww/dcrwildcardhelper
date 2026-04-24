@@ -31,8 +31,8 @@ $dcrLocation = $config.dcrLocation
 # TODO make this a parameter
 $dcrResourceGroup = $config.dcrResourceGroup
 
-$maxFilePatternsPerDcr = [int]$config.maxFilePatternsPerDcr
-$runCommandTimeoutSeconds = if ($null -ne $config.runCommandTimeoutSeconds) { [int]$config.runCommandTimeoutSeconds } else { 300 }
+$maxFilePatternsPerDcr = if ($null -ne $config.maxFilePatternsPerDcr) { [int]$config.maxFilePatternsPerDcr } else { 10 }
+$runCommandTimeoutSeconds = if ($null -ne $config.runCommandTimeoutSeconds) { [int]$config.runCommandTimeoutSeconds } else { 600 }
 
 function Format-ElapsedTime {
     param (
@@ -1334,16 +1334,15 @@ function Test-ArcAgentHealth {
             return $false
         }
 
-        # Check if the agent heartbeat is recent (within last 10 minutes)
+        # lastStatusChange is when the status last transitioned (e.g. became Connected), NOT the last heartbeat.
+        # A large age is normal for a healthy agent that has been Connected for days.
         if ($null -ne $machine.properties.lastStatusChange) {
-            $lastHeartbeat = [DateTimeOffset]::Parse($machine.properties.lastStatusChange).UtcDateTime
-            $minutesAgo = ((Get-Date).ToUniversalTime() - $lastHeartbeat).TotalMinutes
-            if ($minutesAgo -gt 10) {
-                Write-ServerLog -VMName $VMName -Message "WARNING: Arc agent last heartbeat was $([math]::Round($minutesAgo, 1)) minutes ago. Agent may be unresponsive." -Color Yellow
-            }
-            else {
-                Write-ServerLog -VMName $VMName -Message "Arc agent is Connected (last heartbeat $([math]::Round($minutesAgo, 1)) min ago)" -Color DarkGreen
-            }
+            $lastStatusChange = [DateTimeOffset]::Parse($machine.properties.lastStatusChange).UtcDateTime
+            $minutesAgo = ((Get-Date).ToUniversalTime() - $lastStatusChange).TotalMinutes
+            Write-ServerLog -VMName $VMName -Message "Arc agent is Connected (status unchanged for $([math]::Round($minutesAgo, 1)) min)" -Color DarkGreen
+        }
+        else {
+            Write-ServerLog -VMName $VMName -Message "Arc agent is Connected" -Color DarkGreen
         }
 
         # Check extensions for failures — especially AzureMonitorLinuxAgent/AzureMonitorWindowsAgent
@@ -1838,11 +1837,11 @@ function Process-ArcDiscoveryResult {
 
         Write-PhaseLog -VMName $machine -Phase 'discovery completed' -Stopwatch $serverStopwatch -Color Green
 
-        $profileFilePatterns = Build-ServerDcrProfileFilePatterns `
+        $profileFilePatterns = @(Build-ServerDcrProfileFilePatterns `
             -VMName $machine `
             -DiscoveredFolders $resultArr `
             -SplunkWildcardPaths $SplunkWildcardPaths `
-            -IsLinuxVm $IsLinuxVm
+            -IsLinuxVm $IsLinuxVm)
 
         if ($profileFilePatterns.Count -eq 0) {
             Write-ServerLog -VMName $machine -Message "No DCR file patterns were produced for this server profile - skipping" -Color Yellow
@@ -2335,11 +2334,11 @@ function main {
 
             Write-PhaseLog -VMName $machine -Phase 'discovery completed' -Stopwatch $serverStopwatch -Color Green
 
-            $profileFilePatterns = Build-ServerDcrProfileFilePatterns `
+            $profileFilePatterns = @(Build-ServerDcrProfileFilePatterns `
                 -VMName $machine `
                 -DiscoveredFolders $resultArr `
                 -SplunkWildcardPaths $splunkWildcardPaths `
-                -IsLinuxVm $IsLinuxVm
+                -IsLinuxVm $IsLinuxVm)
 
             if ($profileFilePatterns.Count -eq 0) {
                 Write-ServerLog -VMName $machine -Message "No DCR file patterns were produced for this server profile - skipping DCR and helper work" -Color Yellow
@@ -2482,7 +2481,8 @@ function main {
 }
 
 # read the configuration file
-$connectedMachinesAndVmsHash = Get-VMListsFromCSV -CsvPath $config.csvPath
+$csvPath = if ($null -ne $config.csvPath -and $config.csvPath -ne '') { $config.csvPath } else { './connectedMachinesAndVms.csv' }
+$connectedMachinesAndVmsHash = Get-VMListsFromCSV -CsvPath $csvPath
 
 # entry point for Azure Linux VMs
 if ($connectedMachinesAndVmsHash["AzureLinuxVMs"].Count -gt 0) {
