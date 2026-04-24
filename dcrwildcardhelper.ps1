@@ -573,7 +573,14 @@ function New-DcrFromWildcard {
                 -Payload $payload `
                 -ErrorAction Stop
 
+            if ($restResponse.StatusCode -lt 200 -or $restResponse.StatusCode -ge 300) {
+                throw "ARM REST API returned HTTP $($restResponse.StatusCode): $($restResponse.Content)"
+            }
+
             $restResource = $restResponse.Content | ConvertFrom-Json
+            if ($null -eq $restResource.id) {
+                throw "ARM REST API response did not contain a resource id. Response: $($restResponse.Content)"
+            }
             $retDcr = [PSCustomObject]@{
                 Id = $restResource.id
             }
@@ -958,7 +965,14 @@ function New-DcrFromProfile {
                 -Payload $payload `
                 -ErrorAction Stop
 
+            if ($restResponse.StatusCode -lt 200 -or $restResponse.StatusCode -ge 300) {
+                throw "ARM REST API returned HTTP $($restResponse.StatusCode): $($restResponse.Content)"
+            }
+
             $restResource = $restResponse.Content | ConvertFrom-Json
+            if ($null -eq $restResource.id) {
+                throw "ARM REST API response did not contain a resource id. Response: $($restResponse.Content)"
+            }
             $retDcr = [PSCustomObject]@{ Id = $restResource.id }
         }
         catch {
@@ -1848,7 +1862,7 @@ function Process-ArcDiscoveryResult {
             return
         }
 
-        $dcrProfileChunks = @(Split-ArrayIntoChunks -Items $profileFilePatterns -ChunkSize $maxFilePatternsPerDcr)
+        $dcrProfileChunks = Split-ArrayIntoChunks -Items $profileFilePatterns -ChunkSize $maxFilePatternsPerDcr
         if ($dcrProfileChunks.Count -gt 1) {
             Write-ServerLog -VMName $machine -Message "Server profile was split into $($dcrProfileChunks.Count) DCR chunks using a maximum of $maxFilePatternsPerDcr file patterns per DCR" -Color Cyan
         }
@@ -2345,7 +2359,7 @@ function main {
                 continue
             }
 
-            $dcrProfileChunks = @(Split-ArrayIntoChunks -Items $profileFilePatterns -ChunkSize $maxFilePatternsPerDcr)
+            $dcrProfileChunks = Split-ArrayIntoChunks -Items $profileFilePatterns -ChunkSize $maxFilePatternsPerDcr
             if ($dcrProfileChunks.Count -gt 1) {
                 Write-ServerLog -VMName $machine -Message "Server profile was split into $($dcrProfileChunks.Count) DCR chunks using a maximum of $maxFilePatternsPerDcr file patterns per DCR" -Color Cyan
             }
