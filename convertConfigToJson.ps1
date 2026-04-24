@@ -22,9 +22,9 @@ $windowsArcSplunkWildcardPatterns = @(
 $windowsAzureSplunkWildcardPatterns = $windowsArcSplunkWildcardPatterns;
 
 $dcrLocation = "westeurope"
-$scriptStorageAccount = "arcserversukssa"
+$scriptStorageAccount = "arserverssa"
 $scriptContainerName = "scripts"
-$dcrResourceGroup = "arc-servers-uks"
+$dcrResourceGroup = "dcr-test-rg"
 $maxFilePatternsPerDcr = 100
 $maxParallelJobs = 10
 $sleepTime = 60

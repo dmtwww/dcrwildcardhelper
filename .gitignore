@@ -2,3 +2,10 @@ preflightchecks.sh
 *.json
 *.log
 connectedMachinesAndVms.csv
+reconnectArcLinux-dcr-test.sh
+reconnectArcLinux.sh
+seedArcLinuxSampleLogs.sh
+seedArcWindowsSampleLogs.ps1
+provisionTestEnvironment.ps1
+connectArcWindows-dcr-test.ps1
+test-run-stats.md

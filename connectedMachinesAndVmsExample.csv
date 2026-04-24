@@ -1,5 +1,5 @@
-ArcAzure,WindowsLinux,SubscriptionId, ResourceGroup, VMName, DCEName, WorkspaceName, TableName
-Arc,Windows,"000000-0000-0000-0000-000000000000", "My-Resource-Group", "myvm1", "my-dce-endpoint", "my-workspace", "my_workspace_table_CL"
-Arc,Linux,"000000-0000-0000-0000-000000000000", "My-Resource-Group", "myvm2", "my-dce-endpoint", "my-workspace", "my_workspace_table_CL"
-Azure,Windows,"000000-0000-0000-0000-000000000000", "My-Resource-Group", "myvm3", "my-dce-endpoint", "my-workspace", "my_workspace_table_CL"
-Azure,Linux,"000000-0000-0000-0000-000000000000", "My-Resource-Group", "myvm4", "my-dce-endpoint", "my-workspace", "my_workspace_table_CL"
+ArcAzure,WindowsLinux,SubscriptionId,ResourceGroup,VMName,DceSubscriptionId,DCEName,WorkspaceName,TableName
+Arc,Windows,"000000-0000-0000-0000-000000000000","My-Resource-Group","myvm1","11111111-1111-1111-1111-111111111111","my-dce-endpoint","my-workspace","my_workspace_table_CL"
+Arc,Linux,"000000-0000-0000-0000-000000000000","My-Resource-Group","myvm2","11111111-1111-1111-1111-111111111111","my-dce-endpoint","my-workspace","my_workspace_table_CL"
+Azure,Windows,"000000-0000-0000-0000-000000000000","My-Resource-Group","myvm3","11111111-1111-1111-1111-111111111111","my-dce-endpoint","my-workspace","my_workspace_table_CL"
+Azure,Linux,"000000-0000-0000-0000-000000000000","My-Resource-Group","myvm4","11111111-1111-1111-1111-111111111111","my-dce-endpoint","my-workspace","my_workspace_table_CL"
