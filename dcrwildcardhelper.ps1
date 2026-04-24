@@ -1059,11 +1059,35 @@ function Ensure-DcrAssociationForResource {
     param (
         [string]$VMName,
         [string]$VmResourceId,
-        [object]$DcrResource
+        [object]$DcrResource,
+        [string]$DceResourceId
     )
 
     try {
         $existingAssociations = @(Get-AzDataCollectionRuleAssociation -ResourceUri $VmResourceId -ErrorAction SilentlyContinue)
+
+        # Ensure DCE association (must use the reserved name 'configurationAccessEndpoint')
+        if (-not [string]::IsNullOrWhiteSpace($DceResourceId)) {
+            $dceAssociation = $existingAssociations | Where-Object { $_.Name -eq 'configurationAccessEndpoint' } | Select-Object -First 1
+            if ($null -eq $dceAssociation) {
+                Write-ServerLog -VMName $VMName -Message "Creating DCE association 'configurationAccessEndpoint' for resource '$VmResourceId'" -Color Yellow
+                $null = New-AzDataCollectionRuleAssociation `
+                    -AssociationName 'configurationAccessEndpoint' `
+                    -ResourceUri $VmResourceId `
+                    -DataCollectionEndpointId $DceResourceId
+                Write-ServerLog -VMName $VMName -Message "Created DCE association 'configurationAccessEndpoint'" -Color Green
+            }
+            elseif ($dceAssociation.DataCollectionEndpointId -ne $DceResourceId) {
+                Write-ServerLog -VMName $VMName -Message "Updating DCE association 'configurationAccessEndpoint' to point to correct DCE" -Color Yellow
+                $null = New-AzDataCollectionRuleAssociation `
+                    -AssociationName 'configurationAccessEndpoint' `
+                    -ResourceUri $VmResourceId `
+                    -DataCollectionEndpointId $DceResourceId
+                Write-ServerLog -VMName $VMName -Message "Updated DCE association 'configurationAccessEndpoint'" -Color Green
+            }
+        }
+
+        # Ensure DCR association
         $matchingAssociation = $existingAssociations | Where-Object { $_.DataCollectionRuleId -eq $DcrResource.ResourceId } | Select-Object -First 1
 
         if ($null -ne $matchingAssociation) {
@@ -1909,7 +1933,8 @@ function Process-ArcDiscoveryResult {
             $associationResult = Ensure-DcrAssociationForResource `
                 -VMName $machine `
                 -VmResourceId $vmResourceId `
-                -DcrResource $dcr
+                -DcrResource $dcr `
+                -DceResourceId $dceResourceId
 
             if ($associationResult.AssociationCreated) {
                 Write-PhaseLog -VMName $machine -Phase "association created: $($associationResult.AssociationName)" -Stopwatch $serverStopwatch -Color Green
@@ -1918,8 +1943,13 @@ function Process-ArcDiscoveryResult {
                 Write-PhaseLog -VMName $machine -Phase "association reused: $($associationResult.AssociationName)" -Stopwatch $serverStopwatch -Color DarkGreen
             }
 
-            foreach ($dcrFilePattern in $chunkPatterns) {
-                $allIngestionEntries += @{ Pattern = $dcrFilePattern; DcrImmutableId = $dcr.Properties.immutableId }
+            if ($dcrResult.DcrCreated -or $associationResult.AssociationCreated) {
+                foreach ($dcrFilePattern in $chunkPatterns) {
+                    $allIngestionEntries += @{ Pattern = $dcrFilePattern; DcrImmutableId = $dcr.Properties.immutableId }
+                }
+            }
+            else {
+                Write-ServerLog -VMName $machine -Message "DCR and association already existed for chunk $($chunkIndex + 1) - skipping historical ingestion for these patterns" -Color DarkGreen
             }
         }
 
@@ -1935,6 +1965,9 @@ function Process-ArcDiscoveryResult {
                 -IsLinuxVm $IsLinuxVm
 
             Write-PhaseLog -VMName $machine -Phase "ingestion started: $($allIngestionEntries.Count) pattern(s)" -Stopwatch $serverStopwatch -Color Blue
+        }
+        else {
+            Write-PhaseLog -VMName $machine -Phase "no new patterns to ingest - skipping historical ingestion" -Stopwatch $serverStopwatch -Color DarkGreen
         }
 
         Set-AzContextForSubscription -SubscriptionId $subscriptionId
@@ -2436,7 +2469,8 @@ function main {
                     $associationResult = Ensure-DcrAssociationForResource `
                         -VMName $machine `
                         -VmResourceId $vmResourceId `
-                        -DcrResource $dcr
+                        -DcrResource $dcr `
+                        -DceResourceId $dceResourceId
                 }
                 catch {
                     if (Test-IsPermissionIssue -ErrorRecord $_) {
@@ -2452,8 +2486,13 @@ function main {
                     Write-PhaseLog -VMName $machine -Phase "association reused: $($associationResult.AssociationName)" -Stopwatch $serverStopwatch -Color DarkGreen
                 }
 
-                foreach ($dcrFilePattern in $chunkPatterns) {
-                    $allIngestionEntries += @{ Pattern = $dcrFilePattern; DcrImmutableId = $dcr.Properties.immutableId }
+                if ($dcrResult.DcrCreated -or $associationResult.AssociationCreated) {
+                    foreach ($dcrFilePattern in $chunkPatterns) {
+                        $allIngestionEntries += @{ Pattern = $dcrFilePattern; DcrImmutableId = $dcr.Properties.immutableId }
+                    }
+                }
+                else {
+                    Write-ServerLog -VMName $machine -Message "DCR and association already existed for chunk $($chunkIndex + 1) - skipping historical ingestion for these patterns" -Color DarkGreen
                 }
             }
 
@@ -2470,6 +2509,9 @@ function main {
                     -IsLinuxVm $IsLinuxVm
 
                 Write-PhaseLog -VMName $machine -Phase "ingestion started: $($allIngestionEntries.Count) pattern(s)" -Stopwatch $serverStopwatch -Color Blue
+            }
+            else {
+                Write-PhaseLog -VMName $machine -Phase "no new patterns to ingest - skipping historical ingestion" -Stopwatch $serverStopwatch -Color DarkGreen
             }
 
             # Clean up associations to old DCRs whose patterns are now fully covered
