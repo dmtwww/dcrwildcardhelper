@@ -9,3 +9,4 @@ seedArcWindowsSampleLogs.ps1
 provisionTestEnvironment.ps1
 connectArcWindows-dcr-test.ps1
 test-run-stats.md
+seed-test-logs.ps1

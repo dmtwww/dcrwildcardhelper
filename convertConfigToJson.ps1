@@ -4,7 +4,6 @@
 # --- Paste old config here ---
 
 $IsTestingMode = $false
-$IsDebugLoggingEnabled = $true
 
 $linuxAzureSplunkWildcardPatterns = @(
     "/var/log/waagent*.log",
@@ -22,30 +21,21 @@ $windowsArcSplunkWildcardPatterns = @(
 $windowsAzureSplunkWildcardPatterns = $windowsArcSplunkWildcardPatterns;
 
 $dcrLocation = "westeurope"
-$scriptStorageAccount = "arserverssa"
-$scriptContainerName = "scripts"
 $dcrResourceGroup = "dcr-test-rg"
 $maxFilePatternsPerDcr = 100
-$maxParallelJobs = 10
-$sleepTime = 60
-$maxRetries = 30
+$runCommandTimeoutSeconds = 600
 
 # --- End of old config ---
 
 $json = [ordered]@{
     isTestingMode         = $IsTestingMode
-    isDebugLoggingEnabled = $IsDebugLoggingEnabled
 
     dcrLocation           = $dcrLocation
     dcrResourceGroup      = $dcrResourceGroup
-    scriptStorageAccount  = $scriptStorageAccount
-    scriptContainerName   = $scriptContainerName
     csvPath               = "./connectedMachinesAndVms.csv"
 
-    maxFilePatternsPerDcr = $maxFilePatternsPerDcr
-    maxParallelJobs       = $maxParallelJobs
-    sleepTime             = $sleepTime
-    maxRetries            = $maxRetries
+    maxFilePatternsPerDcr      = $maxFilePatternsPerDcr
+    runCommandTimeoutSeconds   = $runCommandTimeoutSeconds
 
     linuxAzureSplunkWildcardPatterns   = @($linuxAzureSplunkWildcardPatterns)
     linuxArcSplunkWildcardPatterns     = @($linuxArcSplunkWildcardPatterns)
