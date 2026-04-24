@@ -1848,7 +1848,7 @@ function Process-ArcDiscoveryResult {
             return
         }
 
-        $dcrProfileChunks = Split-ArrayIntoChunks -Items $profileFilePatterns -ChunkSize $maxFilePatternsPerDcr
+        $dcrProfileChunks = @(Split-ArrayIntoChunks -Items $profileFilePatterns -ChunkSize $maxFilePatternsPerDcr)
         if ($dcrProfileChunks.Count -gt 1) {
             Write-ServerLog -VMName $machine -Message "Server profile was split into $($dcrProfileChunks.Count) DCR chunks using a maximum of $maxFilePatternsPerDcr file patterns per DCR" -Color Cyan
         }
@@ -2345,7 +2345,7 @@ function main {
                 continue
             }
 
-            $dcrProfileChunks = Split-ArrayIntoChunks -Items $profileFilePatterns -ChunkSize $maxFilePatternsPerDcr
+            $dcrProfileChunks = @(Split-ArrayIntoChunks -Items $profileFilePatterns -ChunkSize $maxFilePatternsPerDcr)
             if ($dcrProfileChunks.Count -gt 1) {
                 Write-ServerLog -VMName $machine -Message "Server profile was split into $($dcrProfileChunks.Count) DCR chunks using a maximum of $maxFilePatternsPerDcr file patterns per DCR" -Color Cyan
             }
